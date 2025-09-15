@@ -594,8 +594,8 @@ async def fetch_with_retry(func, *args, max_retries=3, **kwargs):
     return None
 
 # ================= UPGRADED: OHLCV, INDICATORS & FEATURES =======================
-@rate_limited(5)  # 5 requests per second
-async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 300, exchange=exchange):
+@rate_limited(3)  # Reduced from 5 to 3 requests per second
+async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 100, exchange=exchange):  # Reduced default limit
     now = datetime.now(timezone.utc)
     
     with get_db_connection() as conn:
@@ -608,7 +608,7 @@ async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 300, e
             
             if cache_age < CACHE_TTL:
                 df = _unpickle_df(row[1])
-                if df is not None and len(df) >= limit * 0.8:  # Check if we have sufficient data
+                if df is not None and len(df) >= 50:  # Reduced requirement from 80% to 50 candles
                     return df.copy()
     
     # If cache is stale or insufficient, fetch new data
@@ -678,7 +678,7 @@ def compute_indicators(df: pd.DataFrame):
     df = compute_advanced_features(df)
     return df
 
-def predict_signal_confidence(df: pd.DataFrame, seq_len=60) -> float:
+def predict_signal_confidence(df: pd.DataFrame, seq_len=50) -> float:  # Reduced seq_len from 60 to 50
     if hybrid_model is None or not PYTORCH_AVAILABLE:
         return calculate_fallback_confidence(df)
 
@@ -690,11 +690,13 @@ def predict_signal_confidence(df: pd.DataFrame, seq_len=60) -> float:
         feature_cols = ['close', 'volume', 'rsi', 'macd', 'macd_sig', 'atr', 'candle_vwap', 'hurst', 'spread_ratio', 'absorption']
         df_features = df[feature_cols].dropna()
 
-        if len(df_features) < seq_len:
+        if len(df_features) < 30:  # Reduced requirement from seq_len to 30
             logger.warning(f"Not enough feature data after dropna ({len(df_features)}) for prediction.")
             return calculate_fallback_confidence(df)
         
-        data_subset = df_features.tail(seq_len).values
+        # Use whatever data we have, even if less than seq_len
+        actual_seq_len = min(seq_len, len(df_features))
+        data_subset = df_features.tail(actual_seq_len).values
         scaled_data = (data_subset - np.mean(data_subset, axis=0)) / (np.std(data_subset, axis=0) + 1e-7)
 
         device = next(hybrid_model.parameters()).device
@@ -971,14 +973,24 @@ async def scan_markets(context: ContextTypes.DEFAULT_TYPE):
                        and t.get('quoteVolume') is not None
                        and not any(skip in t['symbol'] for skip in SKIP_SYMBOLS)]  # Filter out problematic symbols
         
+        # Get top markets but process in smaller batches
         top_markets = sorted(usdt_futures, key=lambda t: t['quoteVolume'], reverse=True)[:TOP_N_MARKETS]
         
         cooldowns = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
-        tasks = [generate_signal(t['info']['symbol'], t['symbol'], cooldowns, exchange) for t in top_markets]
         
-        for alert_data in await asyncio.gather(*tasks):
-            if alert_data:
-                await send_alert(context, alert_data)
+        # Process markets in smaller batches to reduce memory pressure
+        batch_size = 5
+        for i in range(0, len(top_markets), batch_size):
+            batch = top_markets[i:i+batch_size]
+            tasks = [generate_signal(t['info']['symbol'], t['symbol'], cooldowns, exchange) for t in batch]
+            
+            for alert_data in await asyncio.gather(*tasks):
+                if alert_data:
+                    await send_alert(context, alert_data)
+            
+            # Clear memory between batches
+            if i + batch_size < len(top_markets):
+                await cleanup_memory(context)
                 
     except Exception as e:
         logger.error(f"Error during market scan: {e}")
@@ -1104,24 +1116,42 @@ def get_pnl_summary(days=None):
     total_trades, wins = len(pnls), [p for p in pnls if p > 0]
     return f"  - Total Trades: {total_trades}\n  - Win Rate: {(len(wins) / total_trades * 100):.2f}%\n  - Total PNL: {sum(pnls):.2f}%"
 
+# Add a function to clear memory-intensive objects
+def clear_large_objects():
+    """Clear large objects from memory"""
+    large_vars = [var for var in globals().items() if 
+                 isinstance(var[1], (pd.DataFrame, np.ndarray)) and 
+                 hasattr(var[1], 'nbytes') and var[1].nbytes > 1000000]  # 1MB threshold
+    
+    for name, obj in large_vars:
+        if name not in ['exchange', 'performance_tracker', 'risk_manager']:  # Keep essential objects
+            logger.info(f"Clearing large object: {name} ({obj.nbytes/1000000:.2f}MB)")
+            globals()[name] = None
+    
+    gc.collect()
+
 # Performance monitoring function
 async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
     try:
         process = psutil.Process()
         memory_usage = process.memory_info().rss / 1024 / 1024  # MB
-        cpu_percent = process.cpu_percent()
         
-        if memory_usage > 400:  # If using more than 400MB
+        if memory_usage > 300:  # Reduced from 400 to 300MB
             logger.warning(f"High memory usage: {memory_usage:.2f}MB, running garbage collection")
-            gc.collect()  # Force garbage collection
+            gc.collect()
+            clear_large_objects()
             
-        if memory_usage > 500:  # If using more than 500MB
+        if memory_usage > 400:  # Reduced from 500 to 400MB
             logger.warning(f"Critical memory usage: {memory_usage:.2f}MB")
             # Clear cache if memory is too high
             with get_db_connection() as conn:
                 conn.execute("DELETE FROM ohlcv_cache WHERE fetched_at < datetime('now', '-1 hour')")
             
-        if cpu_percent > 80:  # If using more than 80% CPU
+        if memory_usage > 500:  # Emergency measures
+            logger.warning(f"Emergency memory usage: {memory_usage:.2f}MB, restarting may be needed")
+            
+        cpu_percent = process.cpu_percent()
+        if cpu_percent > 80:
             logger.warning(f"High CPU usage: {cpu_percent}%")
             
         # Log performance metrics
@@ -1129,14 +1159,21 @@ async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error monitoring performance: {e}")
 
-# Memory cleanup function
-async def cleanup_memory():
+# Memory cleanup function (fixed to accept context parameter)
+async def cleanup_memory(context: ContextTypes.DEFAULT_TYPE = None):
+    logger.info("Running memory cleanup...")
     gc.collect()
     if PYTORCH_AVAILABLE and torch.cuda.is_available():
         torch.cuda.empty_cache()
+    
+    # Clear OHLCV cache for older entries
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM ohlcv_cache WHERE fetched_at < datetime('now', '-2 hours')")
+    
+    logger.info("Memory cleanup completed")
 
 # Database backup function
-async def backup_database():
+async def backup_database(context: ContextTypes.DEFAULT_TYPE = None):
     if os.path.exists(DB_PATH):
         backup_path = f"{DB_PATH}.backup.{datetime.now().strftime('%Y%m%d')}"
         shutil.copy2(DB_PATH, backup_path)
@@ -1289,7 +1326,7 @@ def main():
     job_queue.run_repeating(scan_markets, interval=SCAN_INTERVAL, first=10)
     job_queue.run_repeating(monitor_signals, interval=MONITOR_INTERVAL, first=5)
     job_queue.run_repeating(monitor_performance, interval=300, first=60)  # Every 5 minutes
-    job_queue.run_repeating(cleanup_memory, interval=3600, first=120)  # Every hour
+    job_queue.run_repeating(cleanup_memory, interval=1800, first=120)  # Every 30 minutes
     job_queue.run_daily(backup_database, time=dtime(hour=2, minute=0, tzinfo=timezone.utc))  # Daily backup at 2 AM UTC
     
     # Daily report and risk reset
