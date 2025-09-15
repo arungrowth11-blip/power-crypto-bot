@@ -147,7 +147,7 @@ ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
 TP_MULT = [float(x) for x in os.environ.get("TP_MULT", "0.75,1.5,3.0").split(",")]
 SL_MULT = float(os.environ.get("SL_MULT", 1.5))
-CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.60))
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.55))
 
 # --- Risk Management ---
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", 0.02))
@@ -165,7 +165,7 @@ REPORT_TIME = dtime(
 PARAMETER_GRID = {
     'RSI_BUY': [50, 52, 55],
     'RSI_SELL': [48, 45, 42],
-    'CONFIDENCE_THRESHOLD': [0.6, 0.60, 0.7],
+    'CONFIDENCE_THRESHOLD': [0.6, 0.55, 0.7],
     'TP_MULT_1': [0.5, 0.75, 1.0],
     'TP_MULT_2': [1.5, 2.0, 2.5],
     'TP_MULT_3': [3.0, 4.0, 5.0],
@@ -1157,4 +1157,5 @@ def main():
     application.run_polling()
 
 if __name__ == "__main__":
+
     main()
