@@ -167,7 +167,7 @@ CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.50))
 # --- Risk Management ---
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", 0.02))
 MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", 10))
-MAX_POSITION_SIZE = float(os.environ.get("MAX_POSITION_SIZE", 0.5))
+MAX_POSITION_SIZE = float(os.environ.get("MAX_POSITION_SIZE", 0.02))
 
 # --- Timezone for Daily Reports ---
 REPORT_TIMEZONE = ZoneInfo(os.environ.get("REPORT_TIMEZONE", "Asia/Kolkata"))
@@ -1214,3 +1214,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
