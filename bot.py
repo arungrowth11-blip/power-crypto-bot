@@ -10,6 +10,8 @@ import asyncio
 import logging
 import csv
 import time
+import requests
+import shutil
 from datetime import datetime, timedelta, time as dtime, timezone, date
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -24,6 +26,8 @@ from telegram.constants import ParseMode
 from dotenv import load_dotenv
 from flask import Flask, request
 import threading
+import functools
+from contextlib import contextmanager
 
 # Load environment variables
 load_dotenv()
@@ -34,18 +38,22 @@ app = Flask(__name__)
 @app.route('/health')
 def health_check():
     try:
-        # Check if database is accessible
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("SELECT 1")
+        # Check database
+        with get_db_connection() as conn:
+            conn.execute("SELECT 1 FROM signals LIMIT 1")
         
-        # Check if exchange connection is working
-        exchange.fetch_status()
+        # Check exchange connection
+        exchange.fetch_time()
         
+        # Check memory
+        memory = psutil.virtual_memory()
+        if memory.percent > 90:
+            return {'status': 'warning', 'memory': f'{memory.percent}%'}, 200
+            
         return {
             'status': 'healthy', 
-            'bot': 'running', 
             'timestamp': datetime.now().isoformat(),
-            'memory_usage': f"{psutil.Process().memory_info().rss / 1024 / 1024:.2f}MB"
+            'memory': f'{memory.percent}%'
         }
     except Exception as e:
         return {'status': 'unhealthy', 'error': str(e)}, 500
@@ -60,12 +68,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# =================== NEW DEPENDENCIES (PyTorch) ======================
-# Initialize variables first
-PYTORCH_AVAILABLE = False
-torch = None
-nn = None
 
 # =================== NEW DEPENDENCIES (PyTorch) ======================
 # Initialize variables first
@@ -147,11 +149,11 @@ BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 OWNER_CHAT_ID = os.environ.get("CRYPTO_OWNER_ID")
 
 # --- Bot & Strategy Parameters ---
-TIMEFRAME = os.environ.get("TIMEFRAME", "60m")
+TIMEFRAME = os.environ.get("TIMEFRAME", "1h")  # Changed from "60m" to "1h"
 TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 30))
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 15 * 60))
 MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 15))
-DB_PATH = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")  # Changed for Render
+DB_PATH = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", 90))
 CHART_CANDLES = int(os.environ.get("CHART_CANDLES", 100))
 HYBRID_MODEL_PATH = os.environ.get("HYBRID_MODEL_PATH", './hybrid_model.pth')
@@ -187,8 +189,9 @@ PARAMETER_GRID = {
     'SL_MULT': [1.0, 1.25, 1.5]
 }
 
-# Problematic symbols to skip
-SKIP_SYMBOLS = ['FARTCOIN/USDT', 'XPIN/USDT', 'MOODENG/USDT', 'DOLO/USDT', 'HOLO/USDT']
+# Problematic symbols to skip (updated with more symbols)
+SKIP_SYMBOLS = ['FARTCOIN/USDT', 'FARTCOINUSDT', 'XPIN/USDT', 'MOODENG/USDT', 
+                'DOLO/USDT', 'HOLO/USDT', 'WLFI/USDT', 'CUDIS/USDT', 'HYPE/USDT']
 
 # ========================== PRE-RUN CHECKS ===========================
 if not BOT_TOKEN or not OWNER_CHAT_ID:
@@ -201,6 +204,24 @@ except ValueError:
     exit()
 
 # ======================= ENHANCED SYSTEMS IMPLEMENTATION =======================
+
+# Database connection context manager
+@contextmanager
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# Safe database operation wrapper
+def safe_db_operation(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except sqlite3.Error as e:
+        logger.error(f"Database error: {e}")
+        return None
 
 # 1. Performance Tracker
 class PerformanceTracker:
@@ -401,7 +422,17 @@ class ExchangeFactory:
                 })
             else:
                 raise ValueError(f"Unsupported exchange: {exchange_name}")
+                
+            # Manage connection pool
+            self.manage_connection_pool(self.exchanges[exchange_name])
+            
         return self.exchanges[exchange_name]
+    
+    def manage_connection_pool(self, exchange):
+        # Increase connection pool size
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        exchange.session.mount('https://', adapter)
+        exchange.session.mount('http://', adapter)
 
 # 6. Portfolio Optimizer (Simplified)
 class PortfolioOptimizer:
@@ -435,7 +466,7 @@ portfolio_optimizer = PortfolioOptimizer()
 
 # Initialize database
 def init_db(path=DB_PATH):
-    with sqlite3.connect(path) as conn:
+    with get_db_connection() as conn:
         # Create tables if they don't exist
         conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
@@ -531,11 +562,43 @@ def _unpickle_df(blob: bytes):
 async def send_notification(context: ContextTypes.DEFAULT_TYPE, message: str):
     await context.bot.send_message(chat_id=OWNER_CHAT_ID_INT, text=message, parse_mode=ParseMode.MARKDOWN)
 
+# Rate limiting decorator
+def rate_limited(max_per_second):
+    min_interval = 1.0 / max_per_second
+    def decorate(func):
+        last_time_called = 0.0
+        @functools.wraps(func)
+        def rate_limited_function(*args, **kwargs):
+            nonlocal last_time_called
+            elapsed = time.time() - last_time_called
+            left_to_wait = min_interval - elapsed
+            if left_to_wait > 0:
+                time.sleep(left_to_wait)
+            ret = func(*args, **kwargs)
+            last_time_called = time.time()
+            return ret
+        return rate_limited_function
+    return decorate
+
+# Retry mechanism
+async def fetch_with_retry(func, *args, max_retries=3, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            if attempt == max_retries - 1:
+                raise e
+            wait_time = 2 ** attempt  # Exponential backoff
+            logger.warning(f"Attempt {attempt+1} failed, retrying in {wait_time}s: {e}")
+            await asyncio.sleep(wait_time)
+    return None
+
 # ================= UPGRADED: OHLCV, INDICATORS & FEATURES =======================
+@rate_limited(5)  # 5 requests per second
 async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 300, exchange=exchange):
     now = datetime.now(timezone.utc)
     
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         row = conn.execute("SELECT fetched_at, blob FROM ohlcv_cache WHERE market_id=? AND timeframe=?", 
                           (market_id, timeframe)).fetchone()
         
@@ -550,7 +613,7 @@ async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 300, e
     
     # If cache is stale or insufficient, fetch new data
     try:
-        bars = await to_thread(exchange.fetch_ohlcv, market_id, timeframe, limit=limit)
+        bars = await fetch_with_retry(to_thread, exchange.fetch_ohlcv, market_id, timeframe, limit=limit)
         if not bars or len(bars) < 20:  # Require minimum bars
             logger.warning(f"Insufficient data for {market_id}: {len(bars) if bars else 0} bars")
             return None
@@ -565,11 +628,17 @@ async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 300, e
         df.set_index("ts", inplace=True)
         
         blob = _pickle_df(df)
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_connection() as conn:
             conn.execute("REPLACE INTO ohlcv_cache(market_id, timeframe, fetched_at, blob) VALUES (?,?,?,?)",
                          (market_id, timeframe, now.isoformat(), blob))
         
         return df
+    except ccxt.BadSymbol as e:
+        logger.warning(f"Invalid symbol {market_id}: {e}")
+        return None
+    except ccxt.BadRequest as e:
+        logger.warning(f"Bad request for {market_id}: {e}")
+        return None
     except Exception as e:
         logger.error(f"Failed to fetch OHLCV for {market_id}: {e}")
         return None
@@ -750,7 +819,7 @@ async def plot_annotated_chart(df: pd.DataFrame, display_symbol: str, entry: flo
 async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, exchange=exchange):
     try:
         # Skip problematic symbols
-        if display_symbol in SKIP_SYMBOLS:
+        if any(skip in display_symbol for skip in SKIP_SYMBOLS):
             return None
             
         # Fetch data: OHLCV and new Order Book features
@@ -818,7 +887,7 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, 
                 sl = entry_price + sl_distance_usd
                 tps = [entry_price - atr * m for m in TP_MULT]
 
-            with sqlite3.connect(DB_PATH) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "INSERT INTO signals (market_id, symbol, direction, entry_price, entry_time, tp1, tp2, tp3, sl, position_size, confidence, market_regime, status)"
@@ -900,7 +969,7 @@ async def scan_markets(context: ContextTypes.DEFAULT_TYPE):
         usdt_futures = [t for t in tickers.values() 
                        if 'USDT' in t['symbol'] 
                        and t.get('quoteVolume') is not None
-                       and t['symbol'] not in SKIP_SYMBOLS]  # Filter out problematic symbols
+                       and not any(skip in t['symbol'] for skip in SKIP_SYMBOLS)]  # Filter out problematic symbols
         
         top_markets = sorted(usdt_futures, key=lambda t: t['quoteVolume'], reverse=True)[:TOP_N_MARKETS]
         
@@ -916,7 +985,7 @@ async def scan_markets(context: ContextTypes.DEFAULT_TYPE):
         await send_notification(context, f"⚠️ An error occurred during the market scan:\n`{e}`")
 
 async def monitor_signals(context: ContextTypes.DEFAULT_TYPE):
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         open_signals = conn.execute("SELECT id, market_id, symbol, direction, entry_price, tp1, tp2, tp3, sl, tp1_hit, tp2_hit FROM signals WHERE status='open'").fetchall()
     if not open_signals: 
         return
@@ -938,7 +1007,7 @@ async def monitor_signals(context: ContextTypes.DEFAULT_TYPE):
         now_iso = datetime.now(timezone.utc).isoformat()
         
         async def close_position(exit_price, pnl_percent, status_msg):
-            with sqlite3.connect(DB_PATH) as conn_update:
+            with get_db_connection() as conn_update:
                 conn_update.execute("UPDATE signals SET status='closed', exit_price=?, exit_time=?, pnl=? WHERE id=?", 
                                   (exit_price, now_iso, pnl_percent, sig_id))
             
@@ -971,11 +1040,11 @@ async def monitor_signals(context: ContextTypes.DEFAULT_TYPE):
                     await close_position(tp3, (tp3 - entry) / entry * 100, "TP3 Hit")
                     continue
                 if not tp2_hit and price >= tp2:
-                    with sqlite3.connect(DB_PATH) as c: 
+                    with get_db_connection() as c: 
                         c.execute("UPDATE signals SET tp2_hit=1 WHERE id=?", (sig_id,))
                     await send_notification(context, f"🎯 *TP2 Hit* for {sym}!")
                 if not tp1_hit and price >= tp1:
-                    with sqlite3.connect(DB_PATH) as c: 
+                    with get_db_connection() as c: 
                         c.execute("UPDATE signals SET tp1_hit=1, sl=? WHERE id=?", (entry, sig_id))
                     await send_notification(context, f"🎯 *TP1 Hit* for {sym}! SL moved to BE ({entry:,.4f}).")
             elif direction == 'short':
@@ -986,11 +1055,11 @@ async def monitor_signals(context: ContextTypes.DEFAULT_TYPE):
                     await close_position(tp3, (entry - tp3) / entry * 100, "TP3 Hit")
                     continue
                 if not tp2_hit and price <= tp2:
-                    with sqlite3.connect(DB_PATH) as c: 
+                    with get_db_connection() as c: 
                         c.execute("UPDATE signals SET tp2_hit=1 WHERE id=?", (sig_id,))
                     await send_notification(context, f"🎯 *TP2 Hit* for {sym}!")
                 if not tp1_hit and price <= tp1:
-                    with sqlite3.connect(DB_PATH) as c: 
+                    with get_db_connection() as c: 
                         c.execute("UPDATE signals SET tp1_hit=1, sl=? WHERE id=?", (entry, sig_id))
                     await send_notification(context, f"🎯 *TP1 Hit* for {sym}! SL moved to BE ({entry:,.4f}).")
         except Exception as e: 
@@ -1028,7 +1097,7 @@ def get_pnl_summary(days=None):
     if days:
         query += " AND exit_time >= ?"
         params.append((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         pnls = [row[0] for row in conn.execute(query, params).fetchall()]
     if not pnls: 
         return "No closed trades found for this period."
@@ -1049,7 +1118,7 @@ async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
         if memory_usage > 500:  # If using more than 500MB
             logger.warning(f"Critical memory usage: {memory_usage:.2f}MB")
             # Clear cache if memory is too high
-            with sqlite3.connect(DB_PATH) as conn:
+            with get_db_connection() as conn:
                 conn.execute("DELETE FROM ohlcv_cache WHERE fetched_at < datetime('now', '-1 hour')")
             
         if cpu_percent > 80:  # If using more than 80% CPU
@@ -1060,6 +1129,30 @@ async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error monitoring performance: {e}")
 
+# Memory cleanup function
+async def cleanup_memory():
+    gc.collect()
+    if PYTORCH_AVAILABLE and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+# Database backup function
+async def backup_database():
+    if os.path.exists(DB_PATH):
+        backup_path = f"{DB_PATH}.backup.{datetime.now().strftime('%Y%m%d')}"
+        shutil.copy2(DB_PATH, backup_path)
+        logger.info(f"Database backed up to {backup_path}")
+
+# Deployment notification
+async def send_deployment_notification(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        commit_hash = os.environ.get('RENDER_GIT_COMMIT', 'unknown')
+        await send_notification(
+            context, 
+            f"🚀 Bot deployed successfully!\nCommit: {commit_hash}\nTime: {datetime.now()}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send deployment notification: {e}")
+
 # ============================== TELEGRAM COMMANDS ==============================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): 
@@ -1069,7 +1162,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): 
         return
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         open_signals = conn.execute("SELECT symbol, direction, entry_price, sl, tp1, tp2, tp3 FROM signals WHERE status='open'").fetchall()
     if not open_signals: 
         await update.message.reply_text("No open positions.")
@@ -1114,7 +1207,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     action, signal_id_str = query.data.split(":")
     signal_id = int(signal_id_str)
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         sig = conn.execute("SELECT market_id, symbol, direction, entry_price, status FROM signals WHERE id=?", (signal_id,)).fetchone()
     if not sig or sig[4] != 'open': 
         await query.edit_message_caption(caption=query.message.caption_markdown + "\n\n*Action failed: Trade closed.*", parse_mode=ParseMode.MARKDOWN)
@@ -1122,7 +1215,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     market_id, symbol, direction, entry_price, _ = sig
     if action == "be":
-        with sqlite3.connect(DB_PATH) as c: 
+        with get_db_connection() as c: 
             c.execute("UPDATE signals SET sl=? WHERE id=?", (entry_price, signal_id))
         msg = f"🛠️ *Manual:* SL for {symbol} moved to BE ({entry_price:,.4f})."
         await send_notification(context, msg)
@@ -1132,7 +1225,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ticker = await to_thread(exchange.fetch_ticker, exchange.market(market_id)['symbol'])
             price = ticker['last']
             pnl = ((price-entry_price)/entry_price*100) if direction=='long' else ((entry_price-price)/entry_price*100)
-            with sqlite3.connect(DB_PATH) as c: 
+            with get_db_connection() as c: 
                 c.execute("UPDATE signals SET status='closed', exit_price=?, exit_time=?, pnl=? WHERE id=?",(price,datetime.now(timezone.utc).isoformat(),pnl,signal_id))
             # Remove from risk manager
             risk_manager.remove_position(symbol)
@@ -1196,6 +1289,8 @@ def main():
     job_queue.run_repeating(scan_markets, interval=SCAN_INTERVAL, first=10)
     job_queue.run_repeating(monitor_signals, interval=MONITOR_INTERVAL, first=5)
     job_queue.run_repeating(monitor_performance, interval=300, first=60)  # Every 5 minutes
+    job_queue.run_repeating(cleanup_memory, interval=3600, first=120)  # Every hour
+    job_queue.run_daily(backup_database, time=dtime(hour=2, minute=0, tzinfo=timezone.utc))  # Daily backup at 2 AM UTC
     
     # Daily report and risk reset
     report_time_aware = dtime(hour=REPORT_TIME.hour, minute=REPORT_TIME.minute, tzinfo=REPORT_TIMEZONE)
@@ -1206,6 +1301,7 @@ def main():
     
     async def post_init(app: Application):
         await app.bot.send_message(chat_id=OWNER_CHAT_ID_INT, text="🚀 *Bot Upgraded & Live!*\nNew features:\n- Advanced Risk Management\n- Multi-Timeframe Analysis\n- Performance Tracking\n- Model Validation")
+        await send_deployment_notification(app)
         logger.info("Startup notification sent to owner.")
     application.post_init = post_init
 
@@ -1214,4 +1310,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
