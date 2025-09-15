@@ -33,7 +33,22 @@ app = Flask(__name__)
 
 @app.route('/health')
 def health_check():
-    return {'status': 'healthy', 'bot': 'running', 'timestamp': datetime.now().isoformat()}
+    try:
+        # Check if database is accessible
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("SELECT 1")
+        
+        # Check if exchange connection is working
+        exchange.fetch_status()
+        
+        return {
+            'status': 'healthy', 
+            'bot': 'running', 
+            'timestamp': datetime.now().isoformat(),
+            'memory_usage': f"{psutil.Process().memory_info().rss / 1024 / 1024:.2f}MB"
+        }
+    except Exception as e:
+        return {'status': 'unhealthy', 'error': str(e)}, 500
 
 @app.route('/')
 def home():
@@ -132,11 +147,11 @@ BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 OWNER_CHAT_ID = os.environ.get("CRYPTO_OWNER_ID")
 
 # --- Bot & Strategy Parameters ---
-TIMEFRAME = os.environ.get("TIMEFRAME", "30m")
-TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 60))
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 30 * 60))
-MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 30))
-DB_PATH = os.environ.get("DB_PATH", "power_crypto_bot.db")
+TIMEFRAME = os.environ.get("TIMEFRAME", "60m")
+TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 30))
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 15 * 60))
+MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 15))
+DB_PATH = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")  # Changed for Render
 CACHE_TTL = int(os.environ.get("CACHE_TTL", 90))
 CHART_CANDLES = int(os.environ.get("CHART_CANDLES", 100))
 HYBRID_MODEL_PATH = os.environ.get("HYBRID_MODEL_PATH", './hybrid_model.pth')
@@ -147,12 +162,12 @@ ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
 TP_MULT = [float(x) for x in os.environ.get("TP_MULT", "0.75,1.5,3.0").split(",")]
 SL_MULT = float(os.environ.get("SL_MULT", 1.5))
-CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.55))
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.50))
 
 # --- Risk Management ---
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", 0.02))
-MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", 5))
-MAX_POSITION_SIZE = float(os.environ.get("MAX_POSITION_SIZE", 0.1))
+MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", 10))
+MAX_POSITION_SIZE = float(os.environ.get("MAX_POSITION_SIZE", 0.5))
 
 # --- Timezone for Daily Reports ---
 REPORT_TIMEZONE = ZoneInfo(os.environ.get("REPORT_TIMEZONE", "Asia/Kolkata"))
@@ -165,12 +180,15 @@ REPORT_TIME = dtime(
 PARAMETER_GRID = {
     'RSI_BUY': [50, 52, 55],
     'RSI_SELL': [48, 45, 42],
-    'CONFIDENCE_THRESHOLD': [0.6, 0.55, 0.7],
+    'CONFIDENCE_THRESHOLD': [0.45, 0.50, 0.55],
     'TP_MULT_1': [0.5, 0.75, 1.0],
     'TP_MULT_2': [1.5, 2.0, 2.5],
     'TP_MULT_3': [3.0, 4.0, 5.0],
     'SL_MULT': [1.0, 1.25, 1.5]
 }
+
+# Problematic symbols to skip
+SKIP_SYMBOLS = ['FARTCOIN/USDT', 'XPIN/USDT', 'MOODENG/USDT', 'DOLO/USDT', 'HOLO/USDT']
 
 # ========================== PRE-RUN CHECKS ===========================
 if not BOT_TOKEN or not OWNER_CHAT_ID:
@@ -348,18 +366,29 @@ class MultiTimeframeAnalyzer:
             'volume_score': volume_score
         }
 
-# 5. Exchange Factory
+# 5. Exchange Factory with improved connection settings
 class ExchangeFactory:
     def __init__(self):
         self.exchanges = {}
         
     def get_exchange(self, exchange_name='binance'):
         if exchange_name not in self.exchanges:
+            exchange_config = {
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future'},
+                'timeout': 30000,
+                'rateLimit': 1000,
+            }
+            
             if exchange_name == 'binance':
-                self.exchanges[exchange_name] = ccxt.binanceusdm({
+                exchange_config.update({
                     'enableRateLimit': True,
-                    'options': {'defaultType': 'future'}
+                    'options': {
+                        'defaultType': 'future',
+                        'adjustForTimeDifference': True,
+                    }
                 })
+                self.exchanges[exchange_name] = ccxt.binanceusdm(exchange_config)
             elif exchange_name == 'bybit':
                 self.exchanges[exchange_name] = ccxt.bybit({
                     'enableRateLimit': True,
@@ -522,10 +551,16 @@ async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 300, e
     # If cache is stale or insufficient, fetch new data
     try:
         bars = await to_thread(exchange.fetch_ohlcv, market_id, timeframe, limit=limit)
-        if not bars: 
+        if not bars or len(bars) < 20:  # Require minimum bars
+            logger.warning(f"Insufficient data for {market_id}: {len(bars) if bars else 0} bars")
             return None
             
         df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
+        # Add data validation
+        if df['close'].isna().any() or df['volume'].isna().any():
+            logger.warning(f"NaN values detected in {market_id} data")
+            return None
+            
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
         df.set_index("ts", inplace=True)
         
@@ -609,8 +644,14 @@ def calculate_fallback_confidence(df):
     try:
         # Simple logic based on recent price action and volume
         recent_returns = df['close'].pct_change().tail(5)
-        avg_return = recent_returns.mean()
-        vol_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-2]
+        avg_return = recent_returns.mean() if not pd.isna(recent_returns.mean()) else 0
+        
+        # Safe volume ratio calculation
+        vol_mean = df['volume'].rolling(20).mean()
+        if len(vol_mean) > 1 and vol_mean.iloc[-2] > 0:
+            vol_ratio = df['volume'].iloc[-1] / vol_mean.iloc[-2]
+        else:
+            vol_ratio = 1.0  # Default neutral value
         
         # Combine factors for a simple confidence score (0-1)
         confidence = 0.5  # Neutral starting point
@@ -708,6 +749,10 @@ async def plot_annotated_chart(df: pd.DataFrame, display_symbol: str, entry: flo
 # ================= UPGRADED: SIGNAL GENERATION & ALERTS ============================
 async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, exchange=exchange):
     try:
+        # Skip problematic symbols
+        if display_symbol in SKIP_SYMBOLS:
+            return None
+            
         # Fetch data: OHLCV and new Order Book features
         df = await fetch_ohlcv_cached(market_id, TIMEFRAME, limit=400, exchange=exchange)
         ob_features = await fetch_orderbook_features(display_symbol, exchange=exchange)
@@ -852,7 +897,11 @@ async def scan_markets(context: ContextTypes.DEFAULT_TYPE):
         markets = await to_thread(exchange.load_markets)
         tickers = await to_thread(exchange.fetch_tickers)
         
-        usdt_futures = [t for t in tickers.values() if 'USDT' in t['symbol'] and t.get('quoteVolume') is not None]
+        usdt_futures = [t for t in tickers.values() 
+                       if 'USDT' in t['symbol'] 
+                       and t.get('quoteVolume') is not None
+                       and t['symbol'] not in SKIP_SYMBOLS]  # Filter out problematic symbols
+        
         top_markets = sorted(usdt_futures, key=lambda t: t['quoteVolume'], reverse=True)[:TOP_N_MARKETS]
         
         cooldowns = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
@@ -986,6 +1035,31 @@ def get_pnl_summary(days=None):
     total_trades, wins = len(pnls), [p for p in pnls if p > 0]
     return f"  - Total Trades: {total_trades}\n  - Win Rate: {(len(wins) / total_trades * 100):.2f}%\n  - Total PNL: {sum(pnls):.2f}%"
 
+# Performance monitoring function
+async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        process = psutil.Process()
+        memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+        cpu_percent = process.cpu_percent()
+        
+        if memory_usage > 400:  # If using more than 400MB
+            logger.warning(f"High memory usage: {memory_usage:.2f}MB, running garbage collection")
+            gc.collect()  # Force garbage collection
+            
+        if memory_usage > 500:  # If using more than 500MB
+            logger.warning(f"Critical memory usage: {memory_usage:.2f}MB")
+            # Clear cache if memory is too high
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("DELETE FROM ohlcv_cache WHERE fetched_at < datetime('now', '-1 hour')")
+            
+        if cpu_percent > 80:  # If using more than 80% CPU
+            logger.warning(f"High CPU usage: {cpu_percent}%")
+            
+        # Log performance metrics
+        logger.info(f"Performance - Memory: {memory_usage:.2f}MB, CPU: {cpu_percent}%")
+    except Exception as e:
+        logger.error(f"Error monitoring performance: {e}")
+
 # ============================== TELEGRAM COMMANDS ==============================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): 
@@ -1094,24 +1168,6 @@ async def forcescan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Forced scan failed: {e}")
         await message.edit_text(f"❌ Scan failed: {str(e)}")
 
-# Performance monitoring function
-async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        process = psutil.Process()
-        memory_usage = process.memory_info().rss / 1024 / 1024  # MB
-        cpu_percent = process.cpu_percent()
-        
-        if memory_usage > 500:  # If using more than 500MB
-            logger.warning(f"High memory usage: {memory_usage:.2f}MB")
-            
-        if cpu_percent > 80:  # If using more than 80% CPU
-            logger.warning(f"High CPU usage: {cpu_percent}%")
-            
-        # Log performance metrics
-        logger.info(f"Performance - Memory: {memory_usage:.2f}MB, CPU: {cpu_percent}%")
-    except Exception as e:
-        logger.error(f"Error monitoring performance: {e}")
-
 # ============================== BOT INITIALIZATION ==============================
 def main():
     # Get port from environment variable (required for Render)
@@ -1157,5 +1213,4 @@ def main():
     application.run_polling()
 
 if __name__ == "__main__":
-
     main()
