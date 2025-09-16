@@ -150,7 +150,7 @@ OWNER_CHAT_ID = os.environ.get("CRYPTO_OWNER_ID")
 
 # --- Bot & Strategy Parameters ---
 TIMEFRAME = os.environ.get("TIMEFRAME", "1h")  # Changed from "60m" to "1h"
-TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 30))
+TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 40))
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 15 * 60))
 MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 30))
 DB_PATH = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")
@@ -182,7 +182,7 @@ REPORT_TIME = dtime(
 PARAMETER_GRID = {
     'RSI_BUY': [50, 52, 55],
     'RSI_SELL': [48, 45, 42],
-    'CONFIDENCE_THRESHOLD': [0.45, 0.50, 0.55],
+    'CONFIDENCE_THRESHOLD': [0.6, 0.60, 0.7],
     'TP_MULT_1': [0.5, 0.75, 1.0],
     'TP_MULT_2': [1.5, 2.0, 2.5],
     'TP_MULT_3': [3.0, 4.0, 5.0],
@@ -1347,4 +1347,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
