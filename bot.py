@@ -149,7 +149,7 @@ BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 OWNER_CHAT_ID = os.environ.get("CRYPTO_OWNER_ID")
 
 # --- Bot & Strategy Parameters ---
-TIMEFRAME = os.environ.get("TIMEFRAME", "1h")  # Changed from "60m" to "1h"
+TIMEFRAME = os.environ.get("TIMEFRAME", "30m")  # Changed from "60m" to "1h"
 TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 40))
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 15 * 60))
 MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 30))
@@ -1347,5 +1347,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
