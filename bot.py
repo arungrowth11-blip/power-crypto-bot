@@ -149,8 +149,8 @@ BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 OWNER_CHAT_ID = os.environ.get("CRYPTO_OWNER_ID")
 
 # --- Bot & Strategy Parameters ---
-TIMEFRAME = os.environ.get("TIMEFRAME", "4H")  # Changed from "60m" to "1h"
-TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 40))
+TIMEFRAME = os.environ.get("TIMEFRAME", "1h")  # Changed from "60m" to "1h"
+TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 30))
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 15 * 60))
 MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 30))
 DB_PATH = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")
@@ -190,8 +190,7 @@ PARAMETER_GRID = {
 }
 
 # Problematic symbols to skip (updated with more symbols)
-SKIP_SYMBOLS = ['FARTCOIN/USDT', 'FARTCOINUSDT', 'XPIN/USDT', 'MOODENG/USDT', 
-                'DOLO/USDT', 'HOLO/USDT', 'WLFI/USDT', 'CUDIS/USDT', 'HYPE/USDT']
+SKIP_SYMBOLS = ['XPIN/USDT','DOLO/USDT']
 
 # ========================== PRE-RUN CHECKS ===========================
 if not BOT_TOKEN or not OWNER_CHAT_ID:
@@ -1347,6 +1346,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
