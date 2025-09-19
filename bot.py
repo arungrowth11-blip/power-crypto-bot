@@ -180,7 +180,7 @@ ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
 TP_MULT = [float(x) for x in os.environ.get("TP_MULT", "0.75,1.5,3.0").split(",")]
 SL_MULT = float(os.environ.get("SL_MULT", 1.5))
-CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.50))
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.40))
 
 # --- Risk Management ---
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", 0.02))
@@ -1449,3 +1449,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
