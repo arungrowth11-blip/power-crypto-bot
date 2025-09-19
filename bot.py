@@ -202,7 +202,7 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PARAMETER_GRID = {
     'RSI_BUY': [50, 52, 55],
     'RSI_SELL': [48, 45, 42],
-    'CONFIDENCE_THRESHOLD': [0.6, 0.60, 0.7],
+    'CONFIDENCE_THRESHOLD': [0.3, 0.40, 0.7],
     'TP_MULT_1': [0.5, 0.75, 1.0],
     'TP_MULT_2': [1.5, 2.0, 2.5],
     'TP_MULT_3': [3.0, 4.0, 5.0],
@@ -1449,4 +1449,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
