@@ -12,6 +12,9 @@ import csv
 import time
 import requests
 import shutil
+import aiohttp
+import random
+import string
 from datetime import datetime, timedelta, time as dtime, timezone, date
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -32,8 +35,11 @@ from contextlib import contextmanager
 # Load environment variables
 load_dotenv()
 
-# Initialize Flask app for health checks
+# Initialize Flask app for health checks and webhook
 app = Flask(__name__)
+
+# Webhook secret for Telegram
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", ''.join(random.choices(string.ascii_letters + string.digits, k=16)))
 
 @app.route('/health')
 def health_check():
@@ -61,6 +67,16 @@ def health_check():
 @app.route('/')
 def home():
     return {'message': 'Crypto Trading Bot is running', 'status': 'active'}
+
+# Webhook endpoint for Telegram
+@app.route('/webhook', methods=['POST'])
+def telegram_webhook():
+    if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
+        return 'Forbidden', 403
+        
+    update = Update.de_json(request.get_json(), application.bot)
+    application.process_update(update)
+    return 'OK'
 
 # ================================= LOGGING ==================================
 logging.basicConfig(
@@ -177,6 +193,10 @@ REPORT_TIME = dtime(
     hour=int(os.environ.get("REPORT_TIME_HOUR", 9)),
     minute=int(os.environ.get("REPORT_TIME_MINUTE", 0))
 )
+
+# --- Webhook Configuration ---
+WEBHOOK_MODE = os.environ.get("WEBHOOK_MODE", "false").lower() == "true"
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 # --- Parameter Optimization Grid ---
 PARAMETER_GRID = {
@@ -521,6 +541,11 @@ def init_db(path=DB_PATH):
             conn.execute("ALTER TABLE signals ADD COLUMN market_regime TEXT")
             logger.info("Added market_regime column to signals table")
             
+        # Add indexes for performance
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ohlcv_cache ON ohlcv_cache(market_id, timeframe)")
+        
     logger.info("Database initialized successfully.")
 
 init_db()
@@ -817,6 +842,15 @@ async def plot_annotated_chart(df: pd.DataFrame, display_symbol: str, entry: flo
     return await to_thread(_plot)
 
 # ================= UPGRADED: SIGNAL GENERATION & ALERTS ============================
+def get_optimal_parameters(market_regime):
+    """Return optimal parameters based on market regime"""
+    regimes = {
+        'trending': {'RSI_BUY': 52, 'RSI_SELL': 48, 'CONFIDENCE_THRESHOLD': 0.60},
+        'mean_reverting': {'RSI_BUY': 45, 'RSI_SELL': 55, 'CONFIDENCE_THRESHOLD': 0.70},
+        'choppy': {'RSI_BUY': 50, 'RSI_SELL': 50, 'CONFIDENCE_THRESHOLD': 0.75}
+    }
+    return regimes.get(market_regime, regimes['choppy'])
+
 async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, exchange=exchange):
     try:
         # Skip problematic symbols
@@ -836,6 +870,10 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, 
         if market_id in cooldowns and cooldowns[market_id] >= last_time: 
             return None
 
+        # Get optimal parameters based on market regime
+        regime = last["market_regime"]
+        params = get_optimal_parameters(regime)
+        
         # --- Model Confidence Check ---
         confidence = await to_thread(predict_signal_confidence, df)
         
@@ -843,8 +881,11 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, 
         confluence_score = await multi_timeframe_analyzer.analyze_multi_timeframe(market_id, exchange)
         combined_confidence = (confidence + confluence_score) / 2
         
-        if combined_confidence < CONFIDENCE_THRESHOLD:
-            logger.info(f"Signal for {display_symbol} skipped. Confidence {combined_confidence:.2f} < {CONFIDENCE_THRESHOLD}")
+        # Use dynamic confidence threshold
+        dynamic_threshold = params['CONFIDENCE_THRESHOLD'] * 0.8  # 20% more permissive initially
+        
+        if combined_confidence < dynamic_threshold:
+            logger.info(f"Signal for {display_symbol} skipped. Confidence {combined_confidence:.2f} < {dynamic_threshold:.2f}")
             return None
 
         # --- Base Strategy Conditions ---
@@ -858,9 +899,9 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, 
         has_neg_imbalance = ob_features.get('imbalance', 0) < -0.1
         
         signal = None
-        if is_uptrend and is_trending_regime and last["rsi"] > 52 and has_volume_spike and has_pos_imbalance:
+        if is_uptrend and is_trending_regime and last["rsi"] > params['RSI_BUY'] and has_volume_spike and has_pos_imbalance:
             signal = "Long"
-        elif is_downtrend and is_trending_regime and last["rsi"] < 48 and has_volume_spike and has_neg_imbalance:
+        elif is_downtrend and is_trending_regime and last["rsi"] < params['RSI_SELL'] and has_volume_spike and has_neg_imbalance:
             signal = "Short"
 
         if signal:
@@ -924,10 +965,10 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, 
 
 def format_alert(symbol, side, entry, sl, tps, confidence, position_size, regime):
     return (
-        f"📩 *{symbol} Signal ({TIMEFRAME})*\n\n"
+        f"📈 *{symbol} Signal ({TIMEFRAME})*\n\n"
         f"{'🚀' if side == 'Long' else '📉'} *Trade Type:* {side.upper()}\n"
-        f"🧠 *Confidence:* {confidence*100:.1f}%\n"
-        f"📈 *Market Regime:* {regime.title()}\n\n"
+        f"🧠  *Confidence:* {confidence*100:.1f}%\n"
+        f"📊 *Market Regime:* {regime.title()}\n\n"
         f"*Trade Parameters:*\n"
         f"  - Entry: {entry:,.4f}\n"
         f"  - Stop-loss: {sl:,.4f}\n\n"
@@ -938,7 +979,7 @@ def format_alert(symbol, side, entry, sl, tps, confidence, position_size, regime
         f"*Sizing & Risk (Based on ${PORTFOLIO_VALUE:,} portfolio):*\n"
         f"  - Suggested Size: {position_size:.4f} {symbol.split('/')[0]}\n"
         f"  - Position Value: ${(position_size * entry):,.2f}\n"
-        f"💡 Move SL to entry after TP1 is hit."
+        f"⚡ Move SL to entry after TP1 is hit."
     )
 
 async def send_alert(context: ContextTypes.DEFAULT_TYPE, alert_data: dict):
@@ -955,14 +996,15 @@ async def send_alert(context: ContextTypes.DEFAULT_TYPE, alert_data: dict):
             )
     except Exception as e:
         logger.error(f"Failed to send photo alert: {e}")
-        await send_notification(context, "⚠️ Error sending chart image:\n\n" + alert_data["text"])
+        await send_notification(context, "❌ Error sending chart image:\n\n" + alert_data["text"])
     finally:
         if os.path.exists(chart_path): 
             os.remove(chart_path)
 
 # ====================== BACKGROUND JOBS & TELEGRAM ======================
-async def scan_markets(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Scanning for new signals with upgraded logic...")
+async def enhanced_scan_markets(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Starting enhanced market scan with detailed logging...")
+    
     try:
         markets = await to_thread(exchange.load_markets)
         tickers = await to_thread(exchange.fetch_tickers)
@@ -970,30 +1012,32 @@ async def scan_markets(context: ContextTypes.DEFAULT_TYPE):
         usdt_futures = [t for t in tickers.values() 
                        if 'USDT' in t['symbol'] 
                        and t.get('quoteVolume') is not None
-                       and not any(skip in t['symbol'] for skip in SKIP_SYMBOLS)]  # Filter out problematic symbols
+                       and not any(skip in t['symbol'] for skip in SKIP_SYMBOLS)]
         
-        # Get top markets but process in smaller batches
         top_markets = sorted(usdt_futures, key=lambda t: t['quoteVolume'], reverse=True)[:TOP_N_MARKETS]
+        
+        logger.info(f"Top {len(top_markets)} markets by volume: {[m['symbol'] for m in top_markets[:5]]}...")
         
         cooldowns = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
         
-        # Process markets in smaller batches to reduce memory pressure
-        batch_size = 5
-        for i in range(0, len(top_markets), batch_size):
-            batch = top_markets[i:i+batch_size]
-            tasks = [generate_signal(t['info']['symbol'], t['symbol'], cooldowns, exchange) for t in batch]
+        for market in top_markets:
+            symbol = market['symbol']
+            market_id = market['info']['symbol']
             
-            for alert_data in await asyncio.gather(*tasks):
-                if alert_data:
-                    await send_alert(context, alert_data)
+            # Detailed logging for each market
+            logger.debug(f"Analyzing {symbol} (ID: {market_id})")
             
-            # Clear memory between batches
-            if i + batch_size < len(top_markets):
-                await cleanup_memory(context)
+            alert_data = await generate_signal(market_id, symbol, cooldowns, exchange)
+            
+            if alert_data:
+                logger.info(f"Signal generated for {symbol}: {alert_data['text'][:100]}...")
+                await send_alert(context, alert_data)
+            else:
+                logger.debug(f"No signal for {symbol}")
                 
     except Exception as e:
-        logger.error(f"Error during market scan: {e}")
-        await send_notification(context, f"⚠️ An error occurred during the market scan:\n`{e}`")
+        logger.error(f"Error during enhanced market scan: {e}")
+        await send_notification(context, f"❌ Market scan error:\n`{e}`")
 
 async def monitor_signals(context: ContextTypes.DEFAULT_TYPE):
     with get_db_connection() as conn:
@@ -1083,7 +1127,7 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     # Add model performance to report
     model_perf = model_validator.calculate_model_performance()
     if isinstance(model_perf, dict):
-        model_report = (f"\n🤖 *Model Performance:*\n"
+        model_report = (f"\n🧠 *Model Performance:*\n"
                        f"  - Accuracy: {model_perf['accuracy']*100:.2f}%\n"
                        f"  - Precision: {model_perf['precision']*100:.2f}%\n"
                        f"  - Recall: {model_perf['recall']*100:.2f}%\n"
@@ -1097,7 +1141,7 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
                    f"  - Open Positions: {len(risk_manager.open_positions)}/{MAX_CONCURRENT_TRADES}")
     report += risk_report
     
-    await send_notification(context, f"📅 *Daily PNL Report*\n\n{report}")
+    await send_notification(context, f"📊 *Daily PNL Report*\n\n{report}")
     
     # Reset daily PnL
     risk_manager.reset_daily_pnl()
@@ -1160,16 +1204,30 @@ async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
 
 # Memory cleanup function (fixed to accept context parameter)
 async def cleanup_memory(context: ContextTypes.DEFAULT_TYPE = None):
-    logger.info("Running memory cleanup...")
-    gc.collect()
+    logger.info("Running comprehensive memory cleanup...")
+    
+    # Clear DataFrame cache
+    global df_cache
+    if 'df_cache' in globals():
+        df_cache.clear()
+    
+    # Clear PyTorch cache if available
     if PYTORCH_AVAILABLE and torch.cuda.is_available():
         torch.cuda.empty_cache()
+        logger.info("Cleared GPU memory")
+    
+    # Force garbage collection
+    gc.collect()
+    
+    # Clear SQLite cache
+    with get_db_connection() as conn:
+        conn.execute("PRAGMA shrink_memory")
     
     # Clear OHLCV cache for older entries
     with get_db_connection() as conn:
         conn.execute("DELETE FROM ohlcv_cache WHERE fetched_at < datetime('now', '-2 hours')")
     
-    logger.info("Memory cleanup completed")
+    logger.info("Comprehensive memory cleanup completed")
 
 # Database backup function
 async def backup_database(context: ContextTypes.DEFAULT_TYPE = None):
@@ -1177,6 +1235,23 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE = None):
         backup_path = f"{DB_PATH}.backup.{datetime.now().strftime('%Y%m%d')}"
         shutil.copy2(DB_PATH, backup_path)
         logger.info(f"Database backed up to {backup_path}")
+
+# Keep-alive function for Render
+async def keep_alive(context: ContextTypes.DEFAULT_TYPE = None):
+    """Ping the app regularly to prevent Render sleep"""
+    if not RENDER_EXTERNAL_URL:
+        return
+        
+    try:
+        health_url = f"{RENDER_EXTERNAL_URL}/health"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(health_url) as resp:
+                if resp.status == 200:
+                    logger.info("Keep-alive ping successful")
+                else:
+                    logger.warning(f"Keep-alive ping failed: {resp.status}")
+    except Exception as e:
+        logger.error(f"Keep-alive error: {e}")
 
 # Deployment notification
 async def send_deployment_notification(context: ContextTypes.DEFAULT_TYPE):
@@ -1216,7 +1291,7 @@ async def model_performance_command(update: Update, context: ContextTypes.DEFAUL
         return
     perf = model_validator.calculate_model_performance()
     if isinstance(perf, dict):
-        message = (f"🤖 *Model Performance Report*\n\n"
+        message = (f"🧠 *Model Performance Report*\n\n"
                   f"Accuracy: {perf['accuracy']*100:.2f}%\n"
                   f"Precision: {perf['precision']*100:.2f}%\n"
                   f"Recall: {perf['recall']*100:.2f}%\n"
@@ -1253,7 +1328,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "be":
         with get_db_connection() as c: 
             c.execute("UPDATE signals SET sl=? WHERE id=?", (entry_price, signal_id))
-        msg = f"🛠️ *Manual:* SL for {symbol} moved to BE ({entry_price:,.4f})."
+        msg = f"⚡ *Manual:* SL for {symbol} moved to BE ({entry_price:,.4f})."
         await send_notification(context, msg)
         await query.edit_message_caption(caption=query.message.caption_markdown + f"\n\n*{msg}*", parse_mode=ParseMode.MARKDOWN)
     elif action == "close":
@@ -1265,11 +1340,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 c.execute("UPDATE signals SET status='closed', exit_price=?, exit_time=?, pnl=? WHERE id=?",(price,datetime.now(timezone.utc).isoformat(),pnl,signal_id))
             # Remove from risk manager
             risk_manager.remove_position(symbol)
-            msg = f"🛠️ *Manual Close:* {symbol} closed at {price:,.4f}. PNL: {pnl:.2f}%."
+            msg = f"⚡ *Manual Close:* {symbol} closed at {price:,.4f}. PNL: {pnl:.2f}%."
             await send_notification(context, msg)
             await query.edit_message_caption(caption=query.message.caption_markdown + f"\n\n*{msg}*", parse_mode=ParseMode.MARKDOWN)
         except Exception as e: 
-            await send_notification(context, f"⚠️ Error closing {symbol}: {e}")
+            await send_notification(context, f"❌ Error closing {symbol}: {e}")
 
 async def testalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): 
@@ -1288,10 +1363,10 @@ async def forcescan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): 
         return
     
-    message = await update.message.reply_text("🔎 Forcing a one-time market scan...")
+    message = await update.message.reply_text("🔍 Forcing a one-time market scan...")
     
     try:
-        await scan_markets(context)
+        await enhanced_scan_markets(context)
         await message.edit_text("✅ One-time scan completed. Check for new signals.")
     except Exception as e:
         logger.error(f"Forced scan failed: {e}")
@@ -1299,19 +1374,15 @@ async def forcescan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================== BOT INITIALIZATION ==============================
 def main():
+    global application
+    
     # Get port from environment variable (required for Render)
     port = int(os.environ.get("PORT", 10000))
     
-    # Start Flask app in a separate thread for health checks
-    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    logger.info(f"Flask health check server started on port {port}")
-    
-    # Initialize and start the Telegram bot
+    # Initialize the Telegram bot application
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Add handlers
     application.add_handler(CommandHandler(["start", "help"], start_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("pnl", pnl_command))
@@ -1321,11 +1392,13 @@ def main():
     application.add_handler(CommandHandler("forcescan", forcescan_cmd))
     application.add_handler(CallbackQueryHandler(button_callback))
     
+    # Set up job queue
     job_queue = application.job_queue
-    job_queue.run_repeating(scan_markets, interval=SCAN_INTERVAL, first=10)
+    job_queue.run_repeating(enhanced_scan_markets, interval=SCAN_INTERVAL, first=10)
     job_queue.run_repeating(monitor_signals, interval=MONITOR_INTERVAL, first=5)
     job_queue.run_repeating(monitor_performance, interval=300, first=60)  # Every 5 minutes
     job_queue.run_repeating(cleanup_memory, interval=1800, first=120)  # Every 30 minutes
+    job_queue.run_repeating(keep_alive, interval=600, first=60)  # Every 10 minutes for keep-alive
     job_queue.run_daily(backup_database, time=dtime(hour=2, minute=0, tzinfo=timezone.utc))  # Daily backup at 2 AM UTC
     
     # Daily report and risk reset
@@ -1335,19 +1408,44 @@ def main():
     # Daily risk reset (at midnight UTC)
     job_queue.run_daily(lambda ctx: risk_manager.reset_daily_pnl(), time=dtime(hour=0, minute=0, tzinfo=timezone.utc))
     
+    # Startup notification
     async def post_init(app: Application):
         await app.bot.send_message(chat_id=OWNER_CHAT_ID_INT, text="🚀 *Bot Upgraded & Live!*\nNew features:\n- Advanced Risk Management\n- Multi-Timeframe Analysis\n- Performance Tracking\n- Model Validation")
         await send_deployment_notification(app)
         logger.info("Startup notification sent to owner.")
+        
+        # Set webhook if in webhook mode
+        if WEBHOOK_MODE and RENDER_EXTERNAL_URL:
+            webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+            await app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=Update.ALL_TYPES
+            )
+            logger.info(f"Webhook set to {webhook_url}")
+    
     application.post_init = post_init
 
-    logger.info("Bot starting polling...")
-    application.run_polling()
+    # Start Flask app in a separate thread
+    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    logger.info(f"Flask health check server started on port {port}")
+    
+    # Start the bot
+    if WEBHOOK_MODE:
+        logger.info("Running in webhook mode")
+        # We're already setting the webhook in post_init
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            secret_token=WEBHOOK_SECRET,
+            webhook_url=f"{RENDER_EXTERNAL_URL}/webhook"
+        )
+    else:
+        logger.info("Running in polling mode")
+        application.run_polling()
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
