@@ -22,3 +22,9 @@ services:
           property: url
       - key: ENVIRONMENT
         value: production
+
+databases:
+  - name: crypto-bot-db
+    plan: free
+    databaseName: crypto_bot
+    user: crypto_bot
