@@ -4,9 +4,21 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: python your_bot_file_name.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.9.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: crypto-bot-db
+          property: connectionString
+      - key: CRYPTO_BOT_TOKEN
+        sync: false
+      - key: CRYPTO_OWNER_ID
+        sync: false
       - key: WEBHOOK_MODE
-        value: true
+        value: "true"
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          name: crypto-trading-bot
+          property: url
+      - key: ENVIRONMENT
+        value: production
