@@ -643,6 +643,7 @@ class MultiTimeframeAnalyzer:
         analysis = {}
         for tf in self.timeframes:
             df = await fetch_ohlcv_cached(symbol, tf, limit=100, exchange_name=exchange_name)
+            
             if df is not None and len(df) > 20:
                 analysis[tf] = self._analyze_timeframe(df)
         return self._confluence_score(analysis)
@@ -1541,7 +1542,7 @@ async def scan_markets(context: Optional[ContextTypes.DEFAULT_TYPE] = None, exch
                 
                 signal_id = res.inserted_primary_key[0] if res.inserted_primary_key else None
                 
-                # Chart + alert if Telegram context is available
+                # Chart + alert if Telegram context is available       
                 chart_df = await fetch_ohlcv_cached(s['market_id'], config.timeframe, 400, exchange_name)
                 chart_path = await plot_annotated_chart(chart_df, s['symbol'], s['entry'], s['sl'], s['tps'])
                 
@@ -2100,3 +2101,4 @@ if __name__ == "__main__":
         logger.info("bot_stopped")
     except Exception as e:
         logger.error("fatal_error", error=str(e))
+
