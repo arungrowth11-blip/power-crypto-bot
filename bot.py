@@ -1,4 +1,3 @@
-Part 1: Core setup (imports, config, infra)
 import os
 import gc
 import csv
@@ -479,8 +478,6 @@ class PortfolioOptimizer:
 
 portfolio_optimizer = PortfolioOptimizer() 
 
-Part 2: Features, indicators, adaptive policy, model, cache, CCXT wrappers
-
 # ---------------------------- Indicators & Features ----------------------------
 
 def compute_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -837,7 +834,6 @@ def get_optimal_parameters(market_regime: str) -> Dict[str, float]:
     }
     return regimes.get(market_regime, regimes['choppy'])
 
-Part 3: Signal generation, adaptive selection, charts, monitor
 
 # ----------------------------- Signal Generation ------------------------------
 
@@ -1292,8 +1288,6 @@ async def monitor_positions(context: Optional[ContextTypes.DEFAULT_TYPE] = None,
         logger.error(f"Monitor loop error: {e}")
 
 
-Part 4: Telegram handlers, health, scheduler, main
-
 # ------------------------------ Telegram Helpers ------------------------------
 
 application: Optional[Application] = None
@@ -1654,3 +1648,4 @@ if _name_ == "_main_":
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
