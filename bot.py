@@ -1,1450 +1,1656 @@
+Part 1: Core setup (imports, config, infra)
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-import ccxt
 import gc
-import tracemalloc
-import psutil
-import sqlite3
-import pickle
+import csv
+import hmac
+import json
+import time
+import math
 import asyncio
 import logging
-import csv
-import time
-import requests
-import shutil
-import aiohttp
+import pickle
 import random
 import string
-from datetime import datetime, timedelta, time as dtime, timezone, date
-from zoneinfo import ZoneInfo
-from collections import defaultdict
-import json
+import hashlib
+import requests
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.constants import ParseMode
-from dotenv import load_dotenv
-from flask import Flask, request
-import threading
-import functools
-from contextlib import contextmanager
+from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime, timedelta, time as dtime, timezone, date
+from collections import defaultdict
 
-# Load environment variables
-load_dotenv()
+# Timezones
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
-# Initialize Flask app for health checks and webhook
-app = Flask(__name__)
-
-# Webhook secret for Telegram
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", ''.join(random.choices(string.ascii_letters + string.digits, k=16)))
-
-@app.route('/health')
-def health_check():
-    try:
-        # Check database
-        with get_db_connection() as conn:
-            conn.execute("SELECT 1 FROM signals LIMIT 1")
-        
-        # Check exchange connection
-        exchange.fetch_time()
-        
-        # Check memory
-        memory = psutil.virtual_memory()
-        if memory.percent > 90:
-            return {'status': 'warning', 'memory': f'{memory.percent}%'}, 200
-            
-        return {
-            'status': 'healthy', 
-            'timestamp': datetime.now().isoformat(),
-            'memory': f'{memory.percent}%'
-        }
-    except Exception as e:
-        return {'status': 'unhealthy', 'error': str(e)}, 500
-
-@app.route('/')
-def home():
-    return {'message': 'Crypto Trading Bot is running', 'status': 'active'}
-
-# Webhook endpoint for Telegram
-@app.route('/webhook', methods=['POST'])
-def telegram_webhook():
-    if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
-        return 'Forbidden', 403
-        
-    update = Update.de_json(request.get_json(), application.bot)
-    application.process_update(update)
-    return 'OK'
-
-# ================================= LOGGING ==================================
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# =================== NEW DEPENDENCIES (PyTorch) ======================
-# Initialize variables first
+# ML (optional)
 PYTORCH_AVAILABLE = False
 torch = None
 nn = None
-
 try:
     import torch
     import torch.nn as nn
     PYTORCH_AVAILABLE = True
-    logger.info("PyTorch found. Hybrid model functionality will be enabled.")
-except ImportError:
-    logger.warning("PyTorch not found. The new HybridModel will be disabled. Install with 'pip install torch'.")
+except Exception:
+    PYTORCH_AVAILABLE = False
 
-# Define the load_hybrid_model function outside of the conditional block
-def load_hybrid_model(path, model_class):
-    if not PYTORCH_AVAILABLE:
-        logger.warning("Cannot load Hybrid Model because PyTorch is not installed.")
-        return None
-    
-    if not os.path.exists(path):
-        logger.warning(f"Hybrid model not found at {path}. Confidence check will be skipped.")
-        return None
-        
-    try:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Loading Hybrid Model onto device: {device}")
-        
-        model = model_class()
-        model.load_state_dict(torch.load(path, map_location=device))
-        model.to(device)
-        model.eval()
-        logger.info(f"Successfully loaded Hybrid Model from {path}")
-        return model
-    except Exception as e:
-        logger.error(f"Could not load Hybrid Model: {e}")
-        return None
+# Crypto API
+import ccxt
 
-# Only define the HybridModel class if PyTorch is available
-if PYTORCH_AVAILABLE:
-    class HybridModel(nn.Module):
-        def __init__(self, input_size=10, hidden_size=64, nhead=4):
-            super().__init__()
-            self.recurrent_layer = nn.GRU(input_size=input_size, hidden_size=hidden_size, 
-                                        batch_first=True, num_layers=2, dropout=0.2)
-            transformer_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=nhead, 
-                                                         dim_feedforward=256, dropout=0.2, activation='relu', batch_first=True)
-            self.transformer_encoder = nn.TransformerEncoder(transformer_layer, num_layers=2)
-            self.fc1 = nn.Linear(hidden_size, 32)
-            self.relu = nn.ReLU()
-            self.dropout = nn.Dropout(0.3)
-            self.fc2 = nn.Linear(32, 1)
-            self.sigmoid = nn.Sigmoid()
-            
-        def forward(self, x):
-            recurrent_out, _ = self.recurrent_layer(x)
-            trans_out = self.transformer_encoder(recurrent_out)
-            last_step_out = trans_out[:, -1, :]
-            out = self.dropout(self.relu(self.fc1(last_step_out)))
-            return self.sigmoid(self.fc2(out))
-else:
-    # Create a dummy class when PyTorch is not available
-    class HybridModel:
-        def __init__(self, *args, **kwargs):
-            pass
-        
-        def __call__(self, *args, **kwargs):
-            return None
-        
-        def eval(self):
-            pass
-        
-        def to(self, device):
-            return self
+# Web server for health checks & webhook
+from flask import Flask, request, jsonify
 
-# ================================== CONFIG ==================================
+# Telegram bot (async)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# Env
+from dotenv import load_dotenv
+
+# Async DB & Caching
+from sqlalchemy import (
+    MetaData, Table, Column, Integer, Float, String, LargeBinary, Index
+)
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+from sqlalchemy.sql import text as sql_text
+
+# Redis optional
+try:
+    import redis.asyncio as aioredis
+except Exception:
+    aioredis = None
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+
+load_dotenv()
+
 BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 OWNER_CHAT_ID = os.environ.get("CRYPTO_OWNER_ID")
+OWNER_CHAT_ID_INT = int(OWNER_CHAT_ID) if OWNER_CHAT_ID and OWNER_CHAT_ID.isdigit() else None
 
-# --- Bot & Strategy Parameters ---
-TIMEFRAME = os.environ.get("TIMEFRAME", "1h")  # Changed from "60m" to "1h"
-TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 30))
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 15 * 60))
-MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 30))
-DB_PATH = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")
+TIMEFRAME = os.environ.get("TIMEFRAME", "1h")
+TOP_N_MARKETS = int(os.environ.get("TOP_N_MARKETS", 60))  # increased coverage
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 10 * 60))  # faster scans
+MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", 30))  # seconds
 CACHE_TTL = int(os.environ.get("CACHE_TTL", 90))
 CHART_CANDLES = int(os.environ.get("CHART_CANDLES", 100))
 HYBRID_MODEL_PATH = os.environ.get("HYBRID_MODEL_PATH", './hybrid_model.pth')
-PORTFOLIO_VALUE = float(os.environ.get("PORTFOLIO_VALUE", 10000))
+PORTFOLIO_VALUE = float(os.environ.get("PORTFOLIO_VALUE", 10000.0))
 
-# --- Strategy Fine-Tuning ---
 ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
 TP_MULT = [float(x) for x in os.environ.get("TP_MULT", "0.75,1.5,3.0").split(",")]
 SL_MULT = float(os.environ.get("SL_MULT", 1.5))
-CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.50))
 
-# --- Risk Management ---
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", 0.02))
-MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", 10))
+MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", 12))
 MAX_POSITION_SIZE = float(os.environ.get("MAX_POSITION_SIZE", 0.02))
 
-# --- Timezone for Daily Reports ---
 REPORT_TIMEZONE = ZoneInfo(os.environ.get("REPORT_TIMEZONE", "Asia/Kolkata"))
-REPORT_TIME = dtime(
-    hour=int(os.environ.get("REPORT_TIME_HOUR", 9)),
-    minute=int(os.environ.get("REPORT_TIME_MINUTE", 0))
-)
-
-# --- Webhook Configuration ---
 WEBHOOK_MODE = os.environ.get("WEBHOOK_MODE", "false").lower() == "true"
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", ''.join(random.choices(string.ascii_letters + string.digits, k=16)))
 
-# --- Parameter Optimization Grid ---
-PARAMETER_GRID = {
-    'RSI_BUY': [50, 52, 55],
-    'RSI_SELL': [48, 45, 42],
-    'CONFIDENCE_THRESHOLD': [0.6, 0.60, 0.7],
-    'TP_MULT_1': [0.5, 0.75, 1.0],
-    'TP_MULT_2': [1.5, 2.0, 2.5],
-    'TP_MULT_3': [3.0, 4.0, 5.0],
-    'SL_MULT': [1.0, 1.25, 1.5]
-}
+DB_URL = os.environ.get("DATABASE_URL", "").strip()
+DB_PATH = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")
+if not DB_URL:
+    DB_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
-# Problematic symbols to skip (updated with more symbols)
-SKIP_SYMBOLS = ['XPIN/USDT','DOLO/USDT']
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
-# ========================== PRE-RUN CHECKS ===========================
-if not BOT_TOKEN or not OWNER_CHAT_ID:
-    logger.critical("CRITICAL: BOT_TOKEN or CRYPTO_OWNER_ID environment variable not set. Exiting.")
-    exit()
-try:
-    OWNER_CHAT_ID_INT = int(OWNER_CHAT_ID)
-except ValueError:
-    logger.critical("CRITICAL: CRYPTO_OWNER_ID must be a valid integer. Exiting.")
-    exit()
+SKIP_SYMBOLS = ['XPIN/USDT', 'DOLO/USDT']
 
-# ======================= ENHANCED SYSTEMS IMPLEMENTATION =======================
+# === Adaptive High-Accuracy Signal Controls ===
+TARGET_DAILY_SIGNALS = int(os.environ.get("TARGET_DAILY_SIGNALS", 10))  # target 10/day
+MAX_DAILY_SIGNALS = TARGET_DAILY_SIGNALS
 
-# Database connection context manager
-@contextmanager
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
+# Strict bases (high accuracy first), auto-relax dynamically by time of day and deficit
+BASE_MIN_QUALITY_SCORE = float(os.environ.get("BASE_MIN_QUALITY_SCORE", 0.78))
+BASE_REQUIRE_MTF_SCORE = float(os.environ.get("BASE_REQUIRE_MTF_SCORE", 0.75))
+BASE_CONFIDENCE_FLOOR = float(os.environ.get("BASE_CONFIDENCE_FLOOR", 0.70))
+BASE_MIN_VOL_ZSCORE = float(os.environ.get("BASE_MIN_VOL_ZSCORE", 2.5))
+BASE_MIN_OBS_IMBALANCE = float(os.environ.get("BASE_MIN_OBS_IMBALANCE", 0.25))
+BASE_EMA_ATR_MIN = float(os.environ.get("BASE_EMA_ATR_MIN", 0.35))
+BASE_ATR_PCTL_MIN = float(os.environ.get("BASE_ATR_PCTL_MIN", 0.35))
+BASE_ATR_PCTL_MAX = float(os.environ.get("BASE_ATR_PCTL_MAX", 0.80))
+
+# Maximum relaxation when behind target (scaled by deficit and time progress)
+RELAX_MAX_QUALITY = float(os.environ.get("RELAX_MAX_QUALITY", 0.12))
+RELAX_MAX_CONF = float(os.environ.get("RELAX_MAX_CONF", 0.08))
+RELAX_MAX_MTF = float(os.environ.get("RELAX_MAX_MTF", 0.10))
+RELAX_MAX_VOLZ = float(os.environ.get("RELAX_MAX_VOLZ", 1.0))
+RELAX_MAX_IMB = float(os.environ.get("RELAX_MAX_IMB", 0.10))
+RELAX_MAX_ATR_P_BAND = float(os.environ.get("RELAX_MAX_ATR_P_BAND", 0.10))
+RELAX_MAX_EMA_ATR = float(os.environ.get("RELAX_MAX_EMA_ATR", 0.10))
+
+# Near-miss window to fill late-day deficits (scaled)
+NEAR_MISS_QUALITY = float(os.environ.get("NEAR_MISS_QUALITY", 0.03))
+NEAR_MISS_CONF = float(os.environ.get("NEAR_MISS_CONF", 0.03))
+NEAR_MISS_MTF = float(os.environ.get("NEAR_MISS_MTF", 0.05))
+NEAR_MISS_VOLZ = float(os.environ.get("NEAR_MISS_VOLZ", 0.5))
+NEAR_MISS_IMB = float(os.environ.get("NEAR_MISS_IMB", 0.05))
+NEAR_MISS_EMA_ATR = float(os.environ.get("NEAR_MISS_EMA_ATR", 0.05))
+DAY_END_CATCHUP_HOURS = int(os.environ.get("DAY_END_CATCHUP_HOURS", 3))  # last N hours more permissive
+
+DAILY_SIGNAL_KEY_PREFIX = "signals:day:"
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("crypto-bot")
+
+# ------------------------------------------------------------------------------
+# Security Manager
+# ------------------------------------------------------------------------------
+
+class SecurityManager:
+    @staticmethod
+    def validate_webhook_secret(req: request, expected: str) -> bool:
+        token = req.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+        return hmac.compare_digest(token, expected)
+
+# ------------------------------------------------------------------------------
+# Memory Manager (PyTorch)
+# ------------------------------------------------------------------------------
+
+class MemoryManager:
+    def _init_(self, max_memory_percent: int = 85):
+        self.max_memory_percent = max_memory_percent
+    def cleanup(self):
+        gc.collect()
+        if PYTORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    def guard(self):
+        self.cleanup()
+
+memory_manager = MemoryManager()
+
+# ------------------------------------------------------------------------------
+# Exchange Rate Limiter
+# ------------------------------------------------------------------------------
+
+class ExchangeRateLimiter:
+    LIMITS = {
+        'binance': {'window_sec': 60, 'weight_limit': 2400},
+        'bybit': {'window_sec': 60, 'weight_limit': 600},
+        'okx': {'window_sec': 60, 'weight_limit': 300},
+    }
+    def _init_(self):
+        self.usage = defaultdict(int)
+        self.window_start = defaultdict(lambda: time.time())
+        self._lock = asyncio.Lock()
+    async def acquire(self, exchange_name: str, weight: int = 1):
+        async with self._lock:
+            now = time.time()
+            limits = self.LIMITS.get(exchange_name, {'window_sec': 60, 'weight_limit': 1200})
+            window = limits['window_sec']
+            limit = limits['weight_limit']
+            if now - self.window_start[exchange_name] >= window:
+                self.window_start[exchange_name] = now
+                self.usage[exchange_name] = 0
+            if self.usage[exchange_name] + weight > limit:
+                sleep_for = window - (now - self.window_start[exchange_name])
+                sleep_for = max(0.0, sleep_for)
+                logger.warning(f"Rate limit reached for {exchange_name}, sleeping {sleep_for:.2f}s")
+                await asyncio.sleep(sleep_for)
+                self.window_start[exchange_name] = time.time()
+                self.usage[exchange_name] = 0
+            self.usage[exchange_name] += weight
+
+rate_limiter = ExchangeRateLimiter()
+
+# ------------------------------------------------------------------------------
+# Exchange Factory
+# ------------------------------------------------------------------------------
+
+class ExchangeFactory:
+    def _init_(self):
+        self.exchanges: Dict[str, Any] = {}
+    def get_exchange(self, name: str = 'binance'):
+        if name in self.exchanges:
+            return self.exchanges[name]
+        config = {
+            'enableRateLimit': True,
+            'timeout': 30000,
+            'rateLimit': 1000,
+        }
+        if name == 'binance':
+            config['options'] = {'defaultType': 'future', 'adjustForTimeDifference': True}
+            ex = ccxt.binanceusdm(config)
+        elif name == 'bybit':
+            config['options'] = {'defaultType': 'future'}
+            ex = ccxt.bybit(config)
+        elif name == 'okx':
+            config['options'] = {'defaultType': 'future'}
+            ex = ccxt.okx(config)
+        else:
+            raise ValueError(f"Unsupported exchange {name}")
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        ex.session.mount('https://', adapter)
+        ex.session.mount('http://', adapter)
+        self.exchanges[name] = ex
+        return ex
+
+exchange_factory = ExchangeFactory()
+exchange = exchange_factory.get_exchange('binance')
+
+# ------------------------------------------------------------------------------
+# Async Database Setup (SQLAlchemy)
+# ------------------------------------------------------------------------------
+
+metadata = MetaData()
+
+signals_table = Table(
+    "signals", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("market_id", String(64)),
+    Column("symbol", String(64), index=True),
+    Column("direction", String(8)),
+    Column("entry_price", Float),
+    Column("entry_time", String(64)),
+    Column("tp1", Float),
+    Column("tp2", Float),
+    Column("tp3", Float),
+    Column("sl", Float),
+    Column("position_size", Float),
+    Column("tp1_hit", Integer, default=0),
+    Column("tp2_hit", Integer, default=0),
+    Column("tp3_hit", Integer, default=0),
+    Column("exit_price", Float),
+    Column("exit_time", String(64)),
+    Column("pnl", Float),
+    Column("status", String(16), index=True),
+    Column("confidence", Float),
+    Column("market_regime", String(32)),
+    Index("idx_signals_status", "status"),
+    Index("idx_signals_symbol", "symbol"),
+)
+
+ohlcv_cache_table = Table(
+    "ohlcv_cache", metadata,
+    Column("market_id", String(64), primary_key=True),
+    Column("timeframe", String(16), primary_key=True),
+    Column("fetched_at", String(64)),
+    Column("blob", LargeBinary),
+    Index("idx_ohlcv_cache", "market_id", "timeframe"),
+)
+
+model_performance_table = Table(
+    "model_performance", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("timestamp", String(64)),
+    Column("accuracy", Float),
+    Column("precision", Float),
+    Column("recall", Float),
+    Column("total_predictions", Integer),
+)
+
+engine: AsyncEngine = create_async_engine(DB_URL, pool_size=20, max_overflow=30, pool_pre_ping=True)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+
+# ------------------------------------------------------------------------------
+# Redis Cache (optional)
+# ------------------------------------------------------------------------------
+
+redis_client = None
+if REDIS_URL and aioredis is not None:
     try:
-        yield conn
-    finally:
-        conn.close()
+        redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
+        logger.info("Redis cache enabled")
+    except Exception as e:
+        logger.warning(f"Failed to init Redis: {e}")
+        redis_client = None
 
-# Safe database operation wrapper
-def safe_db_operation(func, *args, **kwargs):
-    try:
-        return func(*args, **kwargs)
-    except sqlite3.Error as e:
-        logger.error(f"Database error: {e}")
-        return None
+# ------------------------------------------------------------------------------
+# Performance Tracker
+# ------------------------------------------------------------------------------
 
-# 1. Performance Tracker
 class PerformanceTracker:
-    def __init__(self):
+    def _init_(self):
         self.today = date.today().isoformat()
         self.filename = f"performance_{self.today}.csv"
-        self._init_csv()
-    
-    def _init_csv(self):
-        with open(self.filename, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'timestamp', 'symbol', 'direction', 'entry', 
-                'exit', 'pnl_percent', 'confidence', 'duration',
-                'market_regime', 'volume_ratio', 'rsi', 'atr_ratio'
-            ])
-    
-    def record_trade(self, trade_data):
-        with open(self.filename, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                trade_data.get('timestamp', datetime.now().isoformat()),
-                trade_data.get('symbol', ''),
-                trade_data.get('direction', ''),
-                trade_data.get('entry_price', ''),
-                trade_data.get('exit_price', ''),
-                trade_data.get('pnl_percent', ''),
-                trade_data.get('confidence', ''),
-                trade_data.get('duration_minutes', ''),
-                trade_data.get('market_regime', ''),
-                trade_data.get('volume_ratio', ''),
-                trade_data.get('rsi', ''),
-                trade_data.get('atr_ratio', '')
-            ])
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'symbol', 'direction', 'entry',
+                    'exit', 'pnl_percent', 'confidence', 'duration',
+                    'market_regime', 'volume_ratio', 'rsi', 'atr_ratio'
+                ])
+    def record_trade(self, trade_data: Dict[str, Any]):
+        try:
+            with open(self.filename, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    trade_data.get('timestamp', datetime.now().isoformat()),
+                    trade_data.get('symbol', ''),
+                    trade_data.get('direction', ''),
+                    trade_data.get('entry_price', ''),
+                    trade_data.get('exit_price', ''),
+                    trade_data.get('pnl_percent', ''),
+                    trade_data.get('confidence', ''),
+                    trade_data.get('duration_minutes', ''),
+                    trade_data.get('market_regime', ''),
+                    trade_data.get('volume_ratio', ''),
+                    trade_data.get('rsi', ''),
+                    trade_data.get('atr_ratio', '')
+                ])
+        except Exception as e:
+            logger.error(f"PerformanceTracker error: {e}")
 
-# 2. Risk Manager
+performance_tracker = PerformanceTracker()
+
+# ------------------------------------------------------------------------------
+# Risk Manager
+# ------------------------------------------------------------------------------
+
 class RiskManager:
-    def __init__(self, portfolio_value):
+    def _init_(self, portfolio_value: float):
         self.portfolio_value = portfolio_value
-        self.daily_pnl = 0
+        self.daily_pnl = 0.0
         self.max_daily_loss = portfolio_value * MAX_DAILY_LOSS
-        self.open_positions = {}
+        self.open_positions: Dict[str, float] = {}
         self.max_concurrent_trades = MAX_CONCURRENT_TRADES
-    
-    def add_position(self, symbol, size_usd):
+    def add_position(self, symbol: str, size_usd: float):
         self.open_positions[symbol] = size_usd
-    
-    def remove_position(self, symbol):
-        if symbol in self.open_positions:
-            del self.open_positions[symbol]
-    
-    def can_open_trade(self, symbol, proposed_size_usd):
+    def remove_position(self, symbol: str):
+        self.open_positions.pop(symbol, None)
+    def can_open_trade(self, symbol: str, proposed_size_usd: float) -> Tuple[bool, str]:
         if self.daily_pnl <= -self.max_daily_loss:
             return False, "Daily loss limit exceeded"
-        
         if len(self.open_positions) >= self.max_concurrent_trades:
             return False, "Max concurrent trades reached"
-        
         if symbol in self.open_positions:
             return False, "Already in this symbol"
-        
         if proposed_size_usd > self.portfolio_value * MAX_POSITION_SIZE:
             return False, "Position size too large"
-        
         return True, "OK"
-    
-    def update_daily_pnl(self, pnl):
+    def update_daily_pnl(self, pnl: float):
         self.daily_pnl += pnl
-    
     def reset_daily_pnl(self):
-        self.daily_pnl = 0
-        logger.info("Daily PnL reset")
+        self.daily_pnl = 0.0
 
-# 3. Model Validator
+risk_manager = RiskManager(PORTFOLIO_VALUE)
+
+# ------------------------------------------------------------------------------
+# Model Validator
+# ------------------------------------------------------------------------------
+
 class ModelValidator:
-    def __init__(self):
-        self.predictions = []
-        self.actuals = []
-    
-    def record_prediction(self, confidence, actual_pnl):
+    def _init_(self):
+        self.predictions: List[float] = []
+        self.actuals: List[int] = []
+    def record_prediction(self, confidence: float, actual_pnl: float):
         self.predictions.append(confidence)
         self.actuals.append(1 if actual_pnl > 0 else 0)
-    
     def calculate_model_performance(self):
         if len(self.predictions) < 10:
             return "Insufficient data"
-        
-        correct = sum(1 for p, a in zip(self.predictions, self.actuals) 
-                     if (p > 0.5 and a == 1) or (p <= 0.5 and a == 0))
+        correct = sum(1 for p, a in zip(self.predictions, self.actuals)
+                      if (p > 0.5 and a == 1) or (p <= 0.5 and a == 0))
         accuracy = correct / len(self.predictions)
-        
-        return {
-            'accuracy': accuracy,
-            'total_predictions': len(self.predictions),
-            'precision': self.calculate_precision(),
-            'recall': self.calculate_recall()
-        }
-    
-    def calculate_precision(self):
-        true_positives = sum(1 for p, a in zip(self.predictions, self.actuals) 
-                            if p > 0.5 and a == 1)
-        false_positives = sum(1 for p, a in zip(self.predictions, self.actuals) 
-                             if p > 0.5 and a == 0)
-        return true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    
-    def calculate_recall(self):
-        true_positives = sum(1 for p, a in zip(self.predictions, self.actuals) 
-                            if p > 0.5 and a == 1)
-        false_negatives = sum(1 for p, a in zip(self.predictions, self.actuals) 
-                             if p <= 0.5 and a == 1)
-        return true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+        precision = self._precision()
+        recall = self._recall()
+        return {'accuracy': accuracy, 'total_predictions': len(self.predictions),
+                'precision': precision, 'recall': recall}
+    def _precision(self):
+        tp = sum(1 for p, a in zip(self.predictions, self.actuals) if p > 0.5 and a == 1)
+        fp = sum(1 for p, a in zip(self.predictions, self.actuals) if p > 0.5 and a == 0)
+        return tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    def _recall(self):
+        tp = sum(1 for p, a in zip(self.predictions, self.actuals) if p > 0.5 and a == 1)
+        fn = sum(1 for p, a in zip(self.predictions, self.actuals) if p <= 0.5 and a == 1)
+        return tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
-# 4. Multi-Timeframe Analyzer
+model_validator = ModelValidator()
+
+# ------------------------------------------------------------------------------
+# Multi-Timeframe Analyzer
+# ------------------------------------------------------------------------------
+
 class MultiTimeframeAnalyzer:
-    def __init__(self):
+    def _init_(self):
         self.timeframes = ['15m', '30m', '1h', '4h']
         self.weights = {'15m': 0.15, '30m': 0.25, '1h': 0.35, '4h': 0.25}
-    
-    async def analyze_multi_timeframe(self, symbol, exchange):
+    async def analyze_multi_timeframe(self, symbol: str, exchange_name: str):
         analysis = {}
-        
         for tf in self.timeframes:
-            df = await fetch_ohlcv_cached(symbol, tf, limit=100, exchange=exchange)
+            df = await fetch_ohlcv_cached(symbol, tf, limit=100, exchange_name=exchange_name)
             if df is not None and len(df) > 20:
-                analysis[tf] = self.analyze_timeframe(df)
-        
-        return self.calculate_confluence_score(analysis)
-    
-    def calculate_confluence_score(self, analysis):
+                analysis[tf] = self._analyze_timeframe(df)
+        return self._confluence_score(analysis)
+    def _confluence_score(self, analysis: Dict[str, Dict[str, float]]) -> float:
         if not analysis:
-            return 0.5  # Neutral score if no data
-            
-        score = 0
+            return 0.5
+        score = 0.0
         for tf, data in analysis.items():
             if tf in self.weights:
                 score += data['trend_score'] * self.weights[tf]
                 score += data['momentum_score'] * self.weights[tf] * 0.5
-        
-        return max(0, min(1, score))  # Normalize to 0-1 range
-    
-    def analyze_timeframe(self, df):
-        # Calculate trend score (EMA cross)
+        return max(0.0, min(1.0, score))
+    def _analyze_timeframe(self, df: pd.DataFrame):
         ema20 = df['close'].ewm(span=20).mean().iloc[-1]
         ema50 = df['close'].ewm(span=50).mean().iloc[-1]
         trend_score = 1.0 if ema20 > ema50 else 0.0
-        
-        # Calculate momentum score (RSI)
         delta = df['close'].diff()
         gain = delta.clip(lower=0).rolling(window=14).mean().iloc[-1]
         loss = -delta.clip(upper=0).rolling(window=14).mean().iloc[-1]
-        rs = gain / loss if loss != 0 else 0
+        rs = gain / loss if loss != 0 else 0.0
         rsi = 100 - (100 / (1 + rs)) if rs != 0 else 50
-        momentum_score = (rsi - 50) / 50  # Normalize to -1 to 1, then scale to 0-1
-        
-        # Calculate volume score
+        momentum_score = (rsi - 50) / 50
         volume_avg = df['volume'].rolling(20).mean().iloc[-1]
-        volume_ratio = df['volume'].iloc[-1] / volume_avg if volume_avg > 0 else 1
-        volume_score = min(1.0, volume_ratio / 2.0)  # Cap at 1.0
-        
-        return {
-            'trend_score': trend_score,
-            'momentum_score': (momentum_score + 1) / 2,  # Convert to 0-1 range
-            'volume_score': volume_score
-        }
+        volume_ratio = df['volume'].iloc[-1] / volume_avg if volume_avg > 0 else 1.0
+        volume_score = min(1.0, volume_ratio / 2.0)
+        return {'trend_score': trend_score, 'momentum_score': (momentum_score + 1) / 2, 'volume_score': volume_score}
 
-# 5. Exchange Factory with improved connection settings
-class ExchangeFactory:
-    def __init__(self):
-        self.exchanges = {}
-        
-    def get_exchange(self, exchange_name='binance'):
-        if exchange_name not in self.exchanges:
-            exchange_config = {
-                'enableRateLimit': True,
-                'options': {'defaultType': 'future'},
-                'timeout': 30000,
-                'rateLimit': 1000,
-            }
-            
-            if exchange_name == 'binance':
-                exchange_config.update({
-                    'enableRateLimit': True,
-                    'options': {
-                        'defaultType': 'future',
-                        'adjustForTimeDifference': True,
-                    }
-                })
-                self.exchanges[exchange_name] = ccxt.binanceusdm(exchange_config)
-            elif exchange_name == 'bybit':
-                self.exchanges[exchange_name] = ccxt.bybit({
-                    'enableRateLimit': True,
-                    'options': {'defaultType': 'future'}
-                })
-            elif exchange_name == 'okx':
-                self.exchanges[exchange_name] = ccxt.okx({
-                    'enableRateLimit': True,
-                    'options': {'defaultType': 'future'}
-                })
-            else:
-                raise ValueError(f"Unsupported exchange: {exchange_name}")
-                
-            # Manage connection pool
-            self.manage_connection_pool(self.exchanges[exchange_name])
-            
-        return self.exchanges[exchange_name]
-    
-    def manage_connection_pool(self, exchange):
-        # Increase connection pool size
-        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
-        exchange.session.mount('https://', adapter)
-        exchange.session.mount('http://', adapter)
+multi_timeframe_analyzer = MultiTimeframeAnalyzer()
 
-# 6. Portfolio Optimizer (Simplified)
+# ------------------------------------------------------------------------------
+# Portfolio Optimizer (simple)
+# ------------------------------------------------------------------------------
+
 class PortfolioOptimizer:
-    def __init__(self):
-        self.correlation_matrix = None
-    
-    async def optimize_allocation(self, signals, portfolio_value):
+    async def optimize_allocation(self, signals: List[Dict[str, Any]], portfolio_value: float):
         if not signals:
             return {}
-        
-        # Simple allocation based on confidence score
-        total_confidence = sum(signal.get('confidence', 0.5) for signal in signals)
-        if total_confidence == 0:
+        total_conf = sum(s.get('confidence', 0.5) for s in signals)
+        if total_conf == 0:
             return {}
-            
         allocations = {}
-        for signal in signals:
-            symbol = signal['symbol']
-            confidence = signal.get('confidence', 0.5)
-            allocations[symbol] = (confidence / total_confidence) * portfolio_value * 0.8  # Use 80% of portfolio
-        
+        for s in signals:
+            symbol = s['symbol']
+            conf = s.get('confidence', 0.5)
+            allocations[symbol] = (conf / total_conf) * portfolio_value * 0.8
         return allocations
 
-# Initialize enhanced systems
-exchange_factory = ExchangeFactory()
-performance_tracker = PerformanceTracker()
-risk_manager = RiskManager(PORTFOLIO_VALUE)
-model_validator = ModelValidator()
-multi_timeframe_analyzer = MultiTimeframeAnalyzer()
-portfolio_optimizer = PortfolioOptimizer()
+portfolio_optimizer = PortfolioOptimizer() 
 
-# Initialize database
-def init_db(path=DB_PATH):
-    with get_db_connection() as conn:
-        # Create tables if they don't exist
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                market_id TEXT, 
-                symbol TEXT, 
-                direction TEXT,
-                entry_price REAL, 
-                entry_time TEXT, 
-                tp1 REAL, 
-                tp2 REAL, 
-                tp3 REAL, 
-                sl REAL,
-                position_size REAL,
-                tp1_hit INTEGER DEFAULT 0, 
-                tp2_hit INTEGER DEFAULT 0, 
-                tp3_hit INTEGER DEFAULT 0,
-                exit_price REAL, 
-                exit_time TEXT, 
-                pnl REAL, 
-                status TEXT DEFAULT 'open',
-                confidence REAL,
-                market_regime TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ohlcv_cache (
-                market_id TEXT, timeframe TEXT, fetched_at TEXT, blob BLOB,
-                PRIMARY KEY(market_id, timeframe)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS model_performance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                accuracy REAL,
-                precision REAL,
-                recall REAL,
-                total_predictions INTEGER
-            )
-        """)
-        
-        # Check for missing columns and add them
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(signals)")
-        existing_columns = [column[1] for column in cursor.fetchall()]
-        
-        if 'confidence' not in existing_columns:
-            conn.execute("ALTER TABLE signals ADD COLUMN confidence REAL")
-            logger.info("Added confidence column to signals table")
-            
-        if 'market_regime' not in existing_columns:
-            conn.execute("ALTER TABLE signals ADD COLUMN market_regime TEXT")
-            logger.info("Added market_regime column to signals table")
-            
-        # Add indexes for performance
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_ohlcv_cache ON ohlcv_cache(market_id, timeframe)")
-        
-    logger.info("Database initialized successfully.")
+Part 2: Features, indicators, adaptive policy, model, cache, CCXT wrappers
 
-init_db()
+# ---------------------------- Indicators & Features ----------------------------
 
-# Initialize primary exchange
-exchange = exchange_factory.get_exchange('binance')
-hybrid_model = load_hybrid_model(HYBRID_MODEL_PATH, HybridModel)
-
-# ============================= AUTHORIZATION & UTILITIES ===============================
-def is_authorized(update: Update) -> bool:
-    user = update.effective_user
-    if user and str(user.id) == str(OWNER_CHAT_ID):
-        return True
-        
-    logger.warning(f"Unauthorized access attempt by user ID: {user.id if user else 'Unknown'}")
-    
-    if user and update.message:
-        update.message.reply_text(
-            "🚫 You are not authorized to use this bot.\n\n"
-            f"Your ID: {user.id}\n"
-            f"Authorized ID: {OWNER_CHAT_ID}"
-        )
-        
-    return False
-
-async def to_thread(func, *args, **kwargs):
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-def _pickle_df(df: pd.DataFrame) -> bytes: 
-    return pickle.dumps(df)
-
-def _unpickle_df(blob: bytes):
-    try: 
-        return pickle.loads(blob)
-    except Exception: 
-        return None
-
-async def send_notification(context: ContextTypes.DEFAULT_TYPE, message: str):
-    await context.bot.send_message(chat_id=OWNER_CHAT_ID_INT, text=message, parse_mode=ParseMode.MARKDOWN)
-
-# Rate limiting decorator
-def rate_limited(max_per_second):
-    min_interval = 1.0 / max_per_second
-    def decorate(func):
-        last_time_called = 0.0
-        @functools.wraps(func)
-        def rate_limited_function(*args, **kwargs):
-            nonlocal last_time_called
-            elapsed = time.time() - last_time_called
-            left_to_wait = min_interval - elapsed
-            if left_to_wait > 0:
-                time.sleep(left_to_wait)
-            ret = func(*args, **kwargs)
-            last_time_called = time.time()
-            return ret
-        return rate_limited_function
-    return decorate
-
-# Retry mechanism
-async def fetch_with_retry(func, *args, max_retries=3, **kwargs):
-    for attempt in range(max_retries):
-        try:
-            return await func(*args, **kwargs)
-        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-            if attempt == max_retries - 1:
-                raise e
-            wait_time = 2 ** attempt  # Exponential backoff
-            logger.warning(f"Attempt {attempt+1} failed, retrying in {wait_time}s: {e}")
-            await asyncio.sleep(wait_time)
-    return None
-
-# ================= UPGRADED: OHLCV, INDICATORS & FEATURES =======================
-@rate_limited(3)  # Reduced from 5 to 3 requests per second
-async def fetch_ohlcv_cached(market_id: str, timeframe: str, limit: int = 100, exchange=exchange):  # Reduced default limit
-    now = datetime.now(timezone.utc)
-    
-    with get_db_connection() as conn:
-        row = conn.execute("SELECT fetched_at, blob FROM ohlcv_cache WHERE market_id=? AND timeframe=?", 
-                          (market_id, timeframe)).fetchone()
-        
-        if row:
-            fetched_at = datetime.fromisoformat(row[0])
-            cache_age = (now - fetched_at).total_seconds()
-            
-            if cache_age < CACHE_TTL:
-                df = _unpickle_df(row[1])
-                if df is not None and len(df) >= 50:  # Reduced requirement from 80% to 50 candles
-                    return df.copy()
-    
-    # If cache is stale or insufficient, fetch new data
-    try:
-        bars = await fetch_with_retry(to_thread, exchange.fetch_ohlcv, market_id, timeframe, limit=limit)
-        if not bars or len(bars) < 20:  # Require minimum bars
-            logger.warning(f"Insufficient data for {market_id}: {len(bars) if bars else 0} bars")
-            return None
-            
-        df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
-        # Add data validation
-        if df['close'].isna().any() or df['volume'].isna().any():
-            logger.warning(f"NaN values detected in {market_id} data")
-            return None
-            
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        df.set_index("ts", inplace=True)
-        
-        blob = _pickle_df(df)
-        with get_db_connection() as conn:
-            conn.execute("REPLACE INTO ohlcv_cache(market_id, timeframe, fetched_at, blob) VALUES (?,?,?,?)",
-                         (market_id, timeframe, now.isoformat(), blob))
-        
-        return df
-    except ccxt.BadSymbol as e:
-        logger.warning(f"Invalid symbol {market_id}: {e}")
-        return None
-    except ccxt.BadRequest as e:
-        logger.warning(f"Bad request for {market_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to fetch OHLCV for {market_id}: {e}")
-        return None
-
-def compute_advanced_features(df):
-    df['candle_vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3)
+def compute_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df['candle_vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3.0)
     log_returns = np.log(df['close'] / df['close'].shift(1)).dropna()
     hurst_exp = log_returns.rolling(window=100).std()
     df['hurst'] = hurst_exp
-    df['market_regime'] = np.where(df['hurst'] > hurst_exp.quantile(0.7), 'trending', 
-                                   np.where(df['hurst'] < hurst_exp.quantile(0.3), 'mean_reverting', 'choppy'))
+    if len(hurst_exp) > 0:
+        q70 = hurst_exp.quantile(0.7)
+        q30 = hurst_exp.quantile(0.3)
+        df['market_regime'] = np.where(df['hurst'] > q70, 'trending',
+                                       np.where(df['hurst'] < q30, 'mean_reverting', 'choppy'))
+    else:
+        df['market_regime'] = 'choppy'
     df['spread_ratio'] = (df['high'] - df['low']) / df['volume'].replace(0, 1e-6)
     df['absorption'] = (df['volume'] * (df['high'] - df['low'])).rolling(14).sum()
     return df
 
-def compute_indicators(df: pd.DataFrame):
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-
-    delta = df["close"].diff()
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    delta = df['close'].diff()
     gain = delta.clip(lower=0).rolling(window=RSI_PERIOD).mean()
     loss = -delta.clip(upper=0).rolling(window=RSI_PERIOD).mean()
     rs = gain / loss
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    ema_fast = df["close"].ewm(span=12, adjust=False).mean()
-    ema_slow = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema_fast - ema_slow
-    df["macd_sig"] = df["macd"].ewm(span=9, adjust=False).mean()
-
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift()).abs()
-    low_close = (df["low"] - df["close"].shift()).abs()
+    df['rsi'] = 100 - (100 / (1 + rs))
+    ema_fast = df['close'].ewm(span=12, adjust=False).mean()
+    ema_slow = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = ema_fast - ema_slow
+    df['macd_sig'] = df['macd'].ewm(span=9, adjust=False).mean()
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
-    
+    df['atr'] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
     df = compute_advanced_features(df)
     return df
 
-def predict_signal_confidence(df: pd.DataFrame, seq_len=50) -> float:  # Reduced seq_len from 60 to 50
-    if hybrid_model is None or not PYTORCH_AVAILABLE:
-        return calculate_fallback_confidence(df)
+# --------------------- Quality Metrics & Volatility Filters --------------------
 
-    if len(df) < seq_len:
-        logger.warning(f"Not enough data ({len(df)} candles) for prediction. Need {seq_len}.")
-        return calculate_fallback_confidence(df)
+def _volume_zscore(df: pd.DataFrame, lookback: int = 20) -> float:
+    v = df['volume']
+    if len(v) < lookback + 2:
+        return 0.0
+    base = v.tail(lookback + 1).iloc[:-1]
+    mu, sigma = base.mean(), base.std() + 1e-9
+    return float((v.iloc[-1] - mu) / sigma)
 
+def _ema_spread_vs_atr(df: pd.DataFrame) -> float:
+    ema20 = df['ema20'].iloc[-2]
+    ema50 = df['ema50'].iloc[-2]
+    atr = df['atr'].iloc[-2]
+    if pd.isna(ema20) or pd.isna(ema50) or pd.isna(atr) or atr <= 0:
+        return 0.0
+    return float(abs(ema20 - ema50) / atr)
+
+def _atr_percentile(df: pd.DataFrame, window: int = 200) -> float:
+    atr_series = df['atr'].dropna()
+    if len(atr_series) < window + 2:
+        return 0.5
+    base = atr_series.tail(window + 1).iloc[:-1]
+    cur = atr_series.iloc[-1]
+    rank = (base < cur).sum()
+    return float(rank / max(1, len(base)))
+
+def _signal_quality_score(confidence: float, mtf_score: float, ema_atr_score: float,
+                          vol_z: float, ob_micro_alpha: float) -> float:
+    # Blend confidence (35%), MTF (25%), EMA/ATR (20%), volume z (10%), orderbook micro-alpha (10%)
+    vol_term = max(0.0, min(1.0, vol_z / 3.0))
+    ob_term = max(0.0, min(1.0, (ob_micro_alpha * 100)))
+    return float(
+        0.35 * confidence +
+        0.25 * mtf_score +
+        0.20 * max(0.0, min(1.0, ema_atr_score)) +
+        0.10 * vol_term +
+        0.10 * ob_term
+    )
+
+# ------------------------------ Adaptive Policy -------------------------------
+
+def _day_progress(tz: ZoneInfo) -> float:
+    now = datetime.now(tz)
+    start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=tz)
+    end = start + timedelta(days=1)
+    total = (end - start).total_seconds()
+    elapsed = (now - start).total_seconds()
+    return max(0.0, min(1.0, elapsed / total))
+
+def _expected_by_now(target: int, tz: ZoneInfo) -> int:
+    prog = _day_progress(tz)
+    adj = math.sqrt(prog)  # slight front-loading to catch active sessions
+    return int(round(target * adj))
+
+def _regime_adjustments(regime: str) -> Dict[str, float]:
+    if regime == 'trending':
+        return {'vol_z_nudge': -0.2, 'imb_nudge': 0.0, 'quality_nudge': -0.0}
+    if regime == 'mean_reverting':
+        return {'vol_z_nudge': 0.1, 'imb_nudge': -0.05, 'quality_nudge': 0.02}
+    return {'vol_z_nudge': 0.0, 'imb_nudge': 0.0, 'quality_nudge': 0.03}
+
+def _compute_dynamic_policy(published: int, target: int, tz: ZoneInfo) -> Dict[str, Any]:
+    exp_now = _expected_by_now(target, tz)
+    deficit = max(0, exp_now - published)
+    prog = _day_progress(tz)
+    base_relax = 0.0 if exp_now == 0 else min(1.0, deficit / max(1.0, exp_now))
+    time_scale = min(1.0, max(0.25, prog * 1.5))
+    relax_alpha = base_relax * time_scale
+    now = datetime.now(tz)
+    hours_left = 24 - now.hour - now.minute / 60.0
+    if hours_left <= DAY_END_CATCHUP_HOURS:
+        relax_alpha = min(1.0, max(relax_alpha, 0.5))
+    thresh = {
+        'min_quality': max(0.5, BASE_MIN_QUALITY_SCORE - RELAX_MAX_QUALITY * relax_alpha),
+        'min_conf':    max(0.5, BASE_CONFIDENCE_FLOOR   - RELAX_MAX_CONF    * relax_alpha),
+        'min_mtf':     max(0.55, BASE_REQUIRE_MTF_SCORE - RELAX_MAX_MTF     * relax_alpha),
+        'min_volz':    max(0.5, BASE_MIN_VOL_ZSCORE     - RELAX_MAX_VOLZ    * relax_alpha),
+        'min_imb':     max(0.05, BASE_MIN_OBS_IMBALANCE - RELAX_MAX_IMB     * relax_alpha),
+        'min_ema_atr': max(0.15, BASE_EMA_ATR_MIN       - RELAX_MAX_EMA_ATR * relax_alpha),
+        'atr_p_min':   max(0.15, BASE_ATR_PCTL_MIN      - RELAX_MAX_ATR_P_BAND * relax_alpha),
+        'atr_p_max':   min(0.95, BASE_ATR_PCTL_MAX      + RELAX_MAX_ATR_P_BAND * relax_alpha),
+    }
+    near = {
+        'dq':   NEAR_MISS_QUALITY * relax_alpha,
+        'dc':   NEAR_MISS_CONF    * relax_alpha,
+        'dm':   NEAR_MISS_MTF     * relax_alpha,
+        'dvz':  NEAR_MISS_VOLZ    * relax_alpha,
+        'dimb': NEAR_MISS_IMB     * relax_alpha,
+        'dema': NEAR_MISS_EMA_ATR * relax_alpha,
+        'active': (relax_alpha > 0.2) or (hours_left <= DAY_END_CATCHUP_HOURS)
+    }
+    return {'thresh': thresh, 'near': near, 'exp_now': exp_now, 'relax_alpha': relax_alpha}
+
+# ---------------------- Hybrid Model & Confidence Scoring ----------------------
+
+class HybridModel(nn.Module):
+    def _init_(self, input_size=10, hidden_size=64, nhead=4):
+        super()._init_()
+        self.recurrent_layer = nn.GRU(input_size=input_size, hidden_size=hidden_size,
+                                      batch_first=True, num_layers=2, dropout=0.2)
+        transformer_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=nhead,
+                                                       dim_feedforward=256, dropout=0.2,
+                                                       activation='relu', batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(transformer_layer, num_layers=2)
+        self.fc1 = nn.Linear(hidden_size, 32)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(32, 1)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        recurrent_out, _ = self.recurrent_layer(x)
+        trans_out = self.transformer_encoder(recurrent_out)
+        last_step_out = trans_out[:, -1, :]
+        out = self.dropout(self.relu(self.fc1(last_step_out)))
+        return self.sigmoid(self.fc2(out))
+
+hybrid_model: Optional[nn.Module] = None
+
+def load_hybrid_model(path: str) -> Optional[nn.Module]:
+    if not PYTORCH_AVAILABLE:
+        logger.warning("PyTorch not available; ML model disabled")
+        return None
+    if not os.path.exists(path):
+        logger.warning(f"Hybrid model not found at {path}")
+        return None
     try:
-        feature_cols = ['close', 'volume', 'rsi', 'macd', 'macd_sig', 'atr', 'candle_vwap', 'hurst', 'spread_ratio', 'absorption']
-        df_features = df[feature_cols].dropna()
-
-        if len(df_features) < 30:  # Reduced requirement from seq_len to 30
-            logger.warning(f"Not enough feature data after dropna ({len(df_features)}) for prediction.")
-            return calculate_fallback_confidence(df)
-        
-        # Use whatever data we have, even if less than seq_len
-        actual_seq_len = min(seq_len, len(df_features))
-        data_subset = df_features.tail(actual_seq_len).values
-        scaled_data = (data_subset - np.mean(data_subset, axis=0)) / (np.std(data_subset, axis=0) + 1e-7)
-
-        device = next(hybrid_model.parameters()).device
-        data_tensor = torch.tensor(scaled_data, dtype=torch.float32).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            prediction = hybrid_model(data_tensor)
-        
-        return prediction.item()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = HybridModel()
+        state = torch.load(path, map_location=device)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+        logger.info(f"Hybrid model loaded on {device}")
+        return model
     except Exception as e:
-        logger.error(f"Hybrid Model prediction failed: {e}. Using fallback confidence.")
-        return calculate_fallback_confidence(df)
+        logger.error(f"Failed to load model: {e}")
+        return None
 
-def calculate_fallback_confidence(df):
-    """Fallback confidence calculation when model fails"""
+hybrid_model = load_hybrid_model(HYBRID_MODEL_PATH)
+
+def calculate_fallback_confidence(df: pd.DataFrame) -> float:
     try:
-        # Simple logic based on recent price action and volume
         recent_returns = df['close'].pct_change().tail(5)
-        avg_return = recent_returns.mean() if not pd.isna(recent_returns.mean()) else 0
-        
-        # Safe volume ratio calculation
+        avg_return = recent_returns.mean() if not pd.isna(recent_returns.mean()) else 0.0
         vol_mean = df['volume'].rolling(20).mean()
         if len(vol_mean) > 1 and vol_mean.iloc[-2] > 0:
             vol_ratio = df['volume'].iloc[-1] / vol_mean.iloc[-2]
         else:
-            vol_ratio = 1.0  # Default neutral value
-        
-        # Combine factors for a simple confidence score (0-1)
-        confidence = 0.5  # Neutral starting point
-        confidence += min(0.2, max(-0.2, avg_return * 10))  # Scale returns
-        confidence += min(0.2, max(-0.2, (vol_ratio - 1) * 0.1))  # Scale volume
-        
-        return max(0.1, min(0.9, confidence))  # Keep within reasonable bounds
-    except Exception as e:
-        logger.error(f"Fallback confidence calculation failed: {e}")
-        return 0.5  # Return neutral confidence as last resort
+            vol_ratio = 1.0
+        confidence = 0.5
+        confidence += min(0.2, max(-0.2, avg_return * 10))
+        confidence += min(0.2, max(-0.2, (vol_ratio - 1.0) * 0.1))
+        return max(0.1, min(0.9, confidence))
+    except Exception:
+        return 0.5
 
-# ================= NEW: ORDER BOOK & DYNAMIC SIZING ===================
-async def fetch_orderbook_features(symbol, exchange=exchange):
+def predict_signal_confidence(df: pd.DataFrame, seq_len: int = 50) -> float:
+    if hybrid_model is None or not PYTORCH_AVAILABLE:
+        return calculate_fallback_confidence(df)
+    if len(df) < 30:
+        return calculate_fallback_confidence(df)
     try:
-        ob = await to_thread(exchange.fetch_order_book, symbol, limit=10)
+        feature_cols = ['close', 'volume', 'rsi', 'macd', 'macd_sig', 'atr',
+                        'candle_vwap', 'hurst', 'spread_ratio', 'absorption']
+        df_features = df[feature_cols].dropna()
+        if len(df_features) < 30:
+            return calculate_fallback_confidence(df)
+        actual_seq_len = min(seq_len, len(df_features))
+        data_subset = df_features.tail(actual_seq_len).values
+        scaled = (data_subset - np.mean(data_subset, axis=0)) / (np.std(data_subset, axis=0) + 1e-7)
+        device = next(hybrid_model.parameters()).device
+        with torch.no_grad():
+            memory_manager.guard()
+            tensor = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
+            pred = hybrid_model(tensor)
+            return float(pred.item())
+    except Exception as e:
+        logger.error(f"ML prediction failed: {e}")
+        return calculate_fallback_confidence(df)
+
+# --------------------------- Cache & Serialization -----------------------------
+
+def _pickle_df(df: pd.DataFrame) -> bytes:
+    return pickle.dumps(df)
+
+def _unpickle_df(blob: bytes) -> Optional[pd.DataFrame]:
+    try:
+        return pickle.loads(blob)
+    except Exception:
+        return None
+
+async def cache_set(key: str, value: bytes, ttl: int):
+    if redis_client:
+        try:
+            await redis_client.setex(key, ttl, value)
+            return
+        except Exception as e:
+            logger.warning(f"Redis set failed: {e}")
+
+async def cache_get(key: str) -> Optional[bytes]:
+    if redis_client:
+        try:
+            data = await redis_client.get(key)
+            return data
+        except Exception as e:
+            logger.warning(f"Redis get failed: {e}")
+    return None
+
+# ------------------------------- CCXT Wrappers --------------------------------
+
+async def ccxt_call(exchange_name: str, method: str, weight: int, *args, **kwargs):
+    await rate_limiter.acquire(exchange_name, weight)
+    ex = exchange_factory.get_exchange(exchange_name)
+    func = getattr(ex, method)
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+# -------------------------- OHLCV & Order Book Fetchers -----------------------
+
+async def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int = 100,
+                             exchange_name: str = 'binance') -> Optional[pd.DataFrame]:
+    cache_key = f"ohlcv:{exchange_name}:{symbol}:{timeframe}:{limit}"
+    blob = await cache_get(cache_key)
+    if blob:
+        df = _unpickle_df(blob)
+        if df is not None and len(df) >= 20:
+            return df
+    try:
+        async with engine.begin() as conn:
+            res = await conn.execute(
+                sql_text("SELECT fetched_at, blob FROM ohlcv_cache WHERE market_id = :m AND timeframe = :t"),
+                {"m": symbol, "t": timeframe}
+            )
+            row = res.fetchone()
+            if row:
+                fetched_at = datetime.fromisoformat(row[0])
+                age = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+                if age < CACHE_TTL:
+                    df = _unpickle_df(row[1])
+                    if df is not None and len(df) >= 20:
+                        await cache_set(cache_key, row[1], CACHE_TTL)
+                        return df
+    except Exception as e:
+        logger.warning(f"DB cache read failed: {e}")
+    try:
+        bars = await ccxt_call(exchange_name, 'fetch_ohlcv', 1, symbol, timeframe, limit=limit)
+        if not bars or len(bars) < 20:
+            return None
+        df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
+        if df['close'].isna().any() or df['volume'].isna().any():
+            return None
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        df.set_index("ts", inplace=True)
+        blob = _pickle_df(df)
+        await cache_set(cache_key, blob, CACHE_TTL)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    sql_text("INSERT INTO ohlcv_cache(market_id, timeframe, fetched_at, blob) "
+                             "VALUES (:m, :t, :f, :b) "
+                             "ON CONFLICT(market_id, timeframe) DO UPDATE SET fetched_at = :f, blob = :b"),
+                    {"m": symbol, "t": timeframe, "f": datetime.now(timezone.utc).isoformat(), "b": blob}
+                )
+        except Exception as e:
+            logger.warning(f"DB cache write failed: {e}")
+        return df
+    except Exception as e:
+        logger.error(f"fetch_ohlcv error for {symbol} {timeframe}: {e}")
+        return None
+
+async def fetch_orderbook_features(symbol: str, exchange_name: str = 'binance') -> Dict[str, float]:
+    try:
+        ob = await ccxt_call(exchange_name, 'fetch_order_book', 1, symbol, 10)
         bids = ob.get('bids', [])
         asks = ob.get('asks', [])
-        if not bids or not asks: 
+        if not bids or not asks:
             return {}
-
-        mid_price = (bids[0][0] + asks[0][0]) / 2
+        mid_price = (bids[0][0] + asks[0][0]) / 2.0
         spread = asks[0][0] - bids[0][0]
-        
         bid_volume = sum(b[1] for b in bids[:5])
         ask_volume = sum(a[1] for a in asks[:5])
-        total_volume = bid_volume + ask_volume
-        
-        imbalance = (bid_volume - ask_volume) / total_volume if total_volume > 0 else 0
-        
+        tot = bid_volume + ask_volume
+        imbalance = (bid_volume - ask_volume) / tot if tot > 0 else 0.0
         return {
             'mid_price': mid_price,
             'spread': spread,
             'imbalance': imbalance,
-            'micro_alpha': (imbalance * spread) / mid_price if mid_price > 0 else 0
+            'micro_alpha': (imbalance * spread) / mid_price if mid_price > 0 else 0.0
         }
     except Exception as e:
-        logger.warning(f"Could not fetch order book for {symbol}: {e}")
+        logger.warning(f"Order book fetch failed for {symbol}: {e}")
         return {}
 
-def dynamic_position_sizing(portfolio_value, volatility_usd, confidence):
-    if volatility_usd <= 0: 
-        return 0
+# ------------------------- Dynamic Sizing & Parameters -------------------------
 
+def dynamic_position_sizing(portfolio_value: float, volatility_usd: float, confidence: float) -> float:
+    if volatility_usd <= 0:
+        return 0.0
     edge = confidence - 0.5
-    if edge <= 0: 
-        return 0
-
+    if edge <= 0:
+        return 0.0
     max_risk_fraction = MAX_DAILY_LOSS
     suggested_risk_fraction = edge * 0.1
-    
     risk_fraction = min(max_risk_fraction, suggested_risk_fraction)
-    
     usd_to_risk = portfolio_value * risk_fraction
-    position_size = usd_to_risk / volatility_usd
-    return position_size
+    size = usd_to_risk / volatility_usd
+    return max(0.0, size)
 
-# ================================ CHARTING =================================
-async def plot_annotated_chart(df: pd.DataFrame, display_symbol: str, entry: float, sl: float, tps: list) -> str:
-    def _plot():
-        df_plot = df.tail(CHART_CANDLES).copy()
-        fig, ax = plt.subplots(figsize=(12, 7), facecolor='#F0F0F0')
-        ax.set_facecolor('#FFFFFF')
-        up = df_plot[df_plot.close >= df_plot.open]
-        down = df_plot[df_plot.close < df_plot.open]
-        width, width2 = 0.005, 0.0005
-        ax.bar(up.index, up.close-up.open, width, bottom=up.open, color='#26a69a')
-        ax.bar(up.index, up.high-up.close, width2, bottom=up.close, color='#26a69a')
-        ax.bar(up.index, up.low-up.open, width2, bottom=up.open, color='#26a69a')
-        ax.bar(down.index, down.close-down.open, width, bottom=down.open, color='#ef5350')
-        ax.bar(down.index, down.high-down.open, width2, bottom=down.open, color='#ef5350')
-        ax.bar(down.index, down.low-down.close, width2, bottom=down.close, color='#ef5350')
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-        plt.xticks(rotation=30)
-        plt.ylabel("Price (USDT)")
-        plt.title(f"{display_symbol} Signal ({TIMEFRAME})", fontsize=16, fontweight='bold')
-        plt.grid(True, linestyle='--', alpha=0.5)
-        x_min, x_max = mdates.date2num(df_plot.index[0]), mdates.date2num(df_plot.index[-1])
-        ax.hlines(entry, x_min, x_max, colors='green', linestyles="--", label=f"Entry {entry:,.4f}")
-        ax.hlines(sl, x_min, x_max, colors='red', linestyles="--", label=f"SL {sl:,.4f}")
-        for i, tp in enumerate(tps, start=1):
-            ax.hlines(tp, x_min, x_max, colors='blue', alpha=0.6, linestyles="--", label=f"TP{i} {tp:,.4f}")
-        plt.legend()
-        plt.tight_layout()
-        fname = f"chart_{display_symbol.replace('/', '')}_{int(datetime.now(timezone.utc).timestamp())}.png"
-        plt.savefig(fname, dpi=150)
-        
-        # Clean up
-        plt.close(fig)
-        del df_plot, fig, ax
-        gc.collect()
-        
-        return fname
-    return await to_thread(_plot)
-
-# ================= UPGRADED: SIGNAL GENERATION & ALERTS ============================
-def get_optimal_parameters(market_regime):
-    """Return optimal parameters based on market regime"""
+def get_optimal_parameters(market_regime: str) -> Dict[str, float]:
     regimes = {
-        'trending': {'RSI_BUY': 52, 'RSI_SELL': 48, 'CONFIDENCE_THRESHOLD': 0.60},
-        'mean_reverting': {'RSI_BUY': 45, 'RSI_SELL': 55, 'CONFIDENCE_THRESHOLD': 0.70},
-        'choppy': {'RSI_BUY': 50, 'RSI_SELL': 50, 'CONFIDENCE_THRESHOLD': 0.75}
+        'trending': {'RSI_BUY': 52, 'RSI_SELL': 48},
+        'mean_reverting': {'RSI_BUY': 45, 'RSI_SELL': 55},
+        'choppy': {'RSI_BUY': 50, 'RSI_SELL': 50},
     }
     return regimes.get(market_regime, regimes['choppy'])
 
-async def generate_signal(market_id: str, display_symbol: str, cooldowns: dict, exchange=exchange):
+Part 3: Signal generation, adaptive selection, charts, monitor
+
+# ----------------------------- Signal Generation ------------------------------
+
+async def generate_signal(market_id: str, display_symbol: str, cooldowns: Dict[str, datetime],
+                          exchange_name: str, dyn_policy: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        # Skip problematic symbols
         if any(skip in display_symbol for skip in SKIP_SYMBOLS):
             return None
-            
-        # Fetch data: OHLCV and new Order Book features
-        df = await fetch_ohlcv_cached(market_id, TIMEFRAME, limit=400, exchange=exchange)
-        ob_features = await fetch_orderbook_features(display_symbol, exchange=exchange)
-        
-        if df is None or len(df) < 100: 
-            return None
-        df = compute_indicators(df)
 
+        df = await fetch_ohlcv_cached(market_id, TIMEFRAME, limit=400, exchange_name=exchange_name)
+        ob_features = await fetch_orderbook_features(display_symbol, exchange_name=exchange_name)
+        if df is None or len(df) < 120:
+            return None
+
+        df = compute_indicators(df)
         last = df.iloc[-2]
         last_time = df.index[-2]
-        if market_id in cooldowns and cooldowns[market_id] >= last_time: 
+        if market_id in cooldowns and cooldowns[market_id] >= last_time:
             return None
 
-        # Get optimal parameters based on market regime
-        regime = last["market_regime"]
-        params = get_optimal_parameters(regime)
-        
-        # --- Model Confidence Check ---
-        confidence = await to_thread(predict_signal_confidence, df)
-        
-        # --- Multi-Timeframe Analysis ---
-        confluence_score = await multi_timeframe_analyzer.analyze_multi_timeframe(market_id, exchange)
-        combined_confidence = (confidence + confluence_score) / 2
-        
-        # Use dynamic confidence threshold
-        dynamic_threshold = params['CONFIDENCE_THRESHOLD'] * 0.8  # 20% more permissive initially
-        
-        if combined_confidence < dynamic_threshold:
-            logger.info(f"Signal for {display_symbol} skipped. Confidence {combined_confidence:.2f} < {dynamic_threshold:.2f}")
-            return None
+        # MTF confluence and confidence
+        mtf_score = await multi_timeframe_analyzer.analyze_multi_timeframe(market_id, exchange_name)
+        confidence = predict_signal_confidence(df)
 
-        # --- Base Strategy Conditions ---
+        # Derived metrics
+        ema_atr = _ema_spread_vs_atr(df)
+        atr_pctl = _atr_percentile(df, window=200)
+        vol_z = _volume_zscore(df, lookback=20)
+        ob_imb = ob_features.get('imbalance', 0.0)
+        ob_micro_alpha = ob_features.get('micro_alpha', 0.0)
+
+        regime = str(last.get("market_regime", "choppy"))
+        r_adj = _regime_adjustments(regime)
+
+        # Dynamic thresholds
+        T = dyn_policy['thresh']
+        min_quality = max(0.0, T['min_quality'] + r_adj['quality_nudge'])
+        min_conf = T['min_conf']
+        min_mtf = T['min_mtf']
+        min_volz = max(0.0, T['min_volz'] + r_adj['vol_z_nudge'])
+        min_imb = max(0.0, T['min_imb'] + r_adj['imb_nudge'])
+        min_ema_atr = T['min_ema_atr']
+        atr_p_min, atr_p_max = T['atr_p_min'], T['atr_p_max']
+
+        # Trend/RSI gate
         is_uptrend = last["ema20"] > last["ema50"]
         is_downtrend = last["ema20"] < last["ema50"]
-        
-        # --- NEW Advanced Conditions ---
-        is_trending_regime = last["market_regime"] == 'trending'
-        has_volume_spike = last["volume"] > df["volume"].rolling(20).mean().iloc[-2] * 1.5
-        has_pos_imbalance = ob_features.get('imbalance', 0) > 0.1
-        has_neg_imbalance = ob_features.get('imbalance', 0) < -0.1
-        
-        signal = None
-        if is_uptrend and is_trending_regime and last["rsi"] > params['RSI_BUY'] and has_volume_spike and has_pos_imbalance:
-            signal = "Long"
-        elif is_downtrend and is_trending_regime and last["rsi"] < params['RSI_SELL'] and has_volume_spike and has_neg_imbalance:
-            signal = "Short"
+        params = get_optimal_parameters(regime)
 
-        if signal:
-            entry_price = float(last["close"])
-            atr = float(last["atr"]) if not pd.isna(last["atr"]) else entry_price * 0.02
-            
-            # --- NEW: Dynamic Position Sizing Calculation ---
-            sl_distance_usd = atr * SL_MULT
-            position_size_coin = dynamic_position_sizing(PORTFOLIO_VALUE, sl_distance_usd, combined_confidence)
-            
-            # --- Risk Management Check ---
-            position_value = position_size_coin * entry_price
-            can_trade, reason = risk_manager.can_open_trade(display_symbol, position_value)
-            if not can_trade:
-                logger.info(f"Risk management blocked trade for {display_symbol}: {reason}")
-                return None
-            
-            # Add position to risk manager
-            risk_manager.add_position(display_symbol, position_value)
-            
-            if signal == "Long":
-                sl = entry_price - sl_distance_usd
-                tps = [entry_price + atr * m for m in TP_MULT]
-            else:
-                sl = entry_price + sl_distance_usd
-                tps = [entry_price - atr * m for m in TP_MULT]
+        side = None
+        if is_uptrend and regime == 'trending' and last["rsi"] > params['RSI_BUY'] and ob_imb > 0:
+            side = "Long"
+        elif is_downtrend and regime == 'trending' and last["rsi"] < params['RSI_SELL'] and ob_imb < 0:
+            side = "Short"
+        if not side:
+            return None
 
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO signals (market_id, symbol, direction, entry_price, entry_time, tp1, tp2, tp3, sl, position_size, confidence, market_regime, status)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')",
-                    (
-                        market_id,
-                        display_symbol,
-                        signal.lower(),
-                        entry_price,
-                        pd.Timestamp(last_time).isoformat(),
-                        tps[0],
-                        tps[1],
-                        tps[2],
-                        sl,
-                        position_size_coin,
-                        combined_confidence,
-                        last['market_regime']
-                    ),
-                )
-                conn.commit()
-                signal_id = cursor.lastrowid
-            
-            cooldowns[market_id] = last_time
-            
-            chart_file = await plot_annotated_chart(df, display_symbol, entry_price, sl, tps)
-            alert_text = format_alert(display_symbol, signal, entry_price, sl, tps, combined_confidence, position_size_coin, last['market_regime'])
-            
-            return {"text": alert_text, "chart": chart_file, "signal_id": signal_id}
+        # Hard gates
+        if not (atr_p_min <= atr_pctl <= atr_p_max):
+            return None
+        if ema_atr < min_ema_atr:
+            return None
 
+        # Quality score and acceptance
+        q = _signal_quality_score(confidence, mtf_score, ema_atr, vol_z, ob_micro_alpha)
+        strict_ok = (
+            (confidence >= min_conf) and
+            (mtf_score >= min_mtf) and
+            (vol_z >= min_volz) and
+            (abs(ob_imb) >= min_imb) and
+            (q >= min_quality)
+        )
+
+        # Near-miss for deficit catch-up
+        near = dyn_policy['near']
+        near_ok = False
+        if near['active'] and not strict_ok:
+            near_ok = (
+                (confidence >= max(0.5, min_conf - near['dc'])) and
+                (mtf_score >= max(0.5, min_mtf - near['dm'])) and
+                (vol_z >= max(0.0, min_volz - near['dvz'])) and
+                (abs(ob_imb) >= max(0.0, min_imb - near['dimb'])) and
+                (q >= max(0.5, min_quality - near['dq'])) and
+                (ema_atr >= max(0.1, min_ema_atr - near['dema']))
+            )
+
+        if not (strict_ok or near_ok):
+            return None
+
+        entry_price = float(last["close"])
+        atr = float(last["atr"]) if not pd.isna(last["atr"]) else entry_price * 0.02
+        sl_dist = atr * SL_MULT
+        position_size_coin = dynamic_position_sizing(PORTFOLIO_VALUE, sl_dist, confidence)
+        position_value = position_size_coin * entry_price
+
+        can_trade, _ = risk_manager.can_open_trade(display_symbol, position_value)
+        if not can_trade:
+            return None
+
+        if side == "Long":
+            sl = entry_price - sl_dist
+            tps = [entry_price + atr * m for m in TP_MULT]
+        else:
+            sl = entry_price + sl_dist
+            tps = [entry_price - atr * m for m in TP_MULT]
+
+        alert = format_alert(display_symbol, side, entry_price, sl, tps, confidence, position_size_coin, regime)
+        return {
+            "symbol": display_symbol,
+            "market_id": market_id,
+            "side": side,
+            "quality": q,
+            "confidence": confidence,
+            "mtf_score": mtf_score,
+            "vol_z": vol_z,
+            "ob_imb": ob_imb,
+            "ob_micro_alpha": ob_micro_alpha,
+            "entry": entry_price,
+            "sl": sl,
+            "tps": tps,
+            "regime": regime,
+            "position_size_coin": position_size_coin,
+            "position_value": position_value,
+            "last_time": last_time,
+            "text": alert,
+            "strict": strict_ok,
+            "near_miss": (not strict_ok) and near_ok
+        }
     except Exception as e:
-        logger.exception(f"Error generating signal for {market_id}: {e}")
-    return None
+        logger.exception(f"Signal generation error for {market_id}: {e}")
+        return None
 
-def format_alert(symbol, side, entry, sl, tps, confidence, position_size, regime):
+# --------------------------------- Charting -----------------------------------
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+async def plot_annotated_chart(df: pd.DataFrame, display_symbol: str, entry: float, sl: float, tps: list) -> str:
+    def _plot():
+        try:
+            df_plot = df.tail(CHART_CANDLES).copy()
+            fig, ax = plt.subplots(figsize=(12, 7), facecolor='#F0F0F0')
+            ax.set_facecolor('#FFFFFF')
+            up = df_plot[df_plot.close >= df_plot.open]
+            down = df_plot[df_plot.close < df_plot.open]
+            width, width2 = 0.005, 0.0005
+            ax.bar(up.index, up.close-up.open, width, bottom=up.open, color='#26a69a')
+            ax.bar(up.index, up.high-up.close, width2, bottom=up.close, color='#26a69a')
+            ax.bar(up.index, up.low-up.open, width2, bottom=up.open, color='#26a69a')
+            ax.bar(down.index, down.close-down.open, width, bottom=down.open, color='#ef5350')
+            ax.bar(down.index, down.high-down.open, width2, bottom=down.open, color='#ef5350')
+            ax.bar(down.index, down.low-down.close, width2, bottom=down.close, color='#ef5350')
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+            plt.xticks(rotation=30)
+            plt.ylabel("Price (USDT)")
+            plt.title(f"{display_symbol} Signal ({TIMEFRAME})", fontsize=16, fontweight='bold')
+            plt.grid(True, linestyle='--', alpha=0.5)
+            x_min, x_max = mdates.date2num(df_plot.index[0]), mdates.date2num(df_plot.index[-1])
+            ax.hlines(entry, x_min, x_max, colors='green', linestyles="--", label=f"Entry {entry:,.4f}")
+            ax.hlines(sl, x_min, x_max, colors='red', linestyles="--", label=f"SL {sl:,.4f}")
+            for i, tp in enumerate(tps, start=1):
+                ax.hlines(tp, x_min, x_max, colors='blue', alpha=0.6, linestyles="--", label=f"TP{i} {tp:,.4f}")
+            plt.legend()
+            plt.tight_layout()
+            fname = f"chart_{display_symbol.replace('/', '')}_{int(datetime.now(timezone.utc).timestamp())}.png"
+            plt.savefig(fname, dpi=150)
+            plt.close(fig)
+            return fname
+        except Exception as e:
+            logger.error(f"Charting failed: {e}")
+            return ""
+    return await asyncio.to_thread(_plot)
+
+def format_alert(symbol: str, side: str, entry: float, sl: float, tps: list, confidence: float, position_size: float, regime: str) -> str:
     return (
-        f"📈 *{symbol} Signal ({TIMEFRAME})*\n\n"
-        f"{'🚀' if side == 'Long' else '📉'} *Trade Type:* {side.upper()}\n"
-        f"🧠  *Confidence:* {confidence*100:.1f}%\n"
-        f"📊 *Market Regime:* {regime.title()}\n\n"
-        f"*Trade Parameters:*\n"
-        f"  - Entry: {entry:,.4f}\n"
-        f"  - Stop-loss: {sl:,.4f}\n\n"
-        f"*Take-Profit Targets:*\n"
-        f"  - TP1: {tps[0]:,.4f}\n"
-        f"  - TP2: {tps[1]:,.4f}\n"
-        f"  - TP3: {tps[2]:,.4f}\n\n"
-        f"*Sizing & Risk (Based on ${PORTFOLIO_VALUE:,} portfolio):*\n"
-        f"  - Suggested Size: {position_size:.4f} {symbol.split('/')[0]}\n"
-        f"  - Position Value: ${(position_size * entry):,.2f}\n"
+        f"📈 {symbol} Signal ({TIMEFRAME})
+
+"
+        f"{'🚀' if side == 'Long' else '📉'} Trade Type: {side.upper()}
+"
+        f"🧠  Confidence: {confidence*100:.1f}%
+"
+        f"📊 Market Regime: {regime.title()}
+
+"
+        f"Trade Parameters:
+"
+        f"  - Entry: {entry:,.4f}
+"
+        f"  - Stop-loss: {sl:,.4f}
+
+"
+        f"Take-Profit Targets:
+"
+        f"  - TP1: {tps[0]:,.4f}
+"
+        f"  - TP2: {tps[1]:,.4f}
+"
+        f"  - TP3: {tps[2]:,.4f}
+
+"
+        f"Sizing & Risk (Based on ${PORTFOLIO_VALUE:,} portfolio):
+"
+        f"  - Suggested Size: {position_size:.4f} {symbol.split('/')[0]}
+"
+        f"  - Position Value: ${(position_size * entry):,.2f}
+"
         f"⚡ Move SL to entry after TP1 is hit."
     )
+
+# ---------------------------- Daily Quota Helpers -----------------------------
+
+async def _get_daily_count() -> int:
+    key = DAILY_SIGNAL_KEY_PREFIX + date.today().isoformat()
+    if redis_client:
+        try:
+            v = await redis_client.get(key)
+            return int(v) if v else 0
+        except Exception:
+            return 0
+    return 0
+
+async def _incr_daily_count(n: int):
+    key = DAILY_SIGNAL_KEY_PREFIX + date.today().isoformat()
+    if redis_client:
+        try:
+            ttl = 24 * 3600
+            pipe = redis_client.pipeline()
+            pipe.incrby(key, n)
+            pipe.expire(key, ttl)
+            await pipe.execute()
+        except Exception:
+            pass
+
+# ---------------------- Adaptive Selection Scanner (Daily) --------------------
+
+async def scan_markets(context: Optional[ContextTypes.DEFAULT_TYPE] = None, exchange_name: str = 'binance'):
+    logger.info("Starting market scan (adaptive high-accuracy mode)...")
+    cooldowns: Dict[str, datetime] = {}
+    try:
+        current_count = await _get_daily_count()
+        remaining_total = max(0, TARGET_DAILY_SIGNALS - current_count)
+        if remaining_total <= 0:
+            logger.info("Daily quota reached; skipping scan")
+            return
+
+        dyn_policy = _compute_dynamic_policy(current_count, TARGET_DAILY_SIGNALS, REPORT_TIMEZONE)
+
+        tickers = await ccxt_call(exchange_name, 'fetch_tickers', 1)
+        if not tickers:
+            logger.warning("No tickers received")
+            return
+        futures_tickers = {k: v for k, v in tickers.items() if k.endswith('/USDT')}
+        sorted_tickers = sorted(
+            futures_tickers.items(),
+            key=lambda x: x[1].get('quoteVolume', 0) or 0,
+            reverse=True
+        )
+
+        strict: List[Dict[str, Any]] = []
+        near_miss: List[Dict[str, Any]] = []
+        for symbol, _tk in sorted_tickers[:TOP_N_MARKETS]:
+            try:
+                cand = await generate_signal(symbol, symbol, cooldowns, exchange_name, dyn_policy)
+                if cand:
+                    if cand['strict']:
+                        strict.append(cand)
+                    elif cand['near_miss']:
+                        near_miss.append(cand)
+            except Exception as e:
+                logger.error(f"Error processing {symbol}: {e}")
+            await asyncio.sleep(0.2)
+
+        if not strict and not near_miss:
+            logger.info("No qualified candidates this scan")
+            return
+
+        # Sort by quality
+        strict.sort(key=lambda c: c['quality'], reverse=True)
+        near_miss.sort(key=lambda c: c['quality'], reverse=True)
+
+        selected: List[Dict[str, Any]] = []
+
+        # Prefer diversity: at least one long and one short from strict if available
+        longs = [c for c in strict if c['side'] == 'Long']
+        shorts = [c for c in strict if c['side'] == 'Short']
+        if longs:
+            selected.append(longs[0])
+        if shorts and len(selected) < remaining_total:
+            selected.append(shorts[0])
+
+        # Fill from remaining strict
+        used = set((s['symbol'], s['side']) for s in selected)
+        for c in strict:
+            if len(selected) >= remaining_total:
+                break
+            key = (c['symbol'], c['side'])
+            if key not in used:
+                selected.append(c)
+                used.add(key)
+
+        # If still deficit, fill from near-miss
+        if len(selected) < remaining_total:
+            for c in near_miss:
+                if len(selected) >= remaining_total:
+                    break
+                key = (c['symbol'], c['side'])
+                if key not in used:
+                    selected.append(c)
+                    used.add(key)
+
+        if not selected:
+            logger.info("No candidates survived final selection")
+            return
+
+        committed = 0
+        async with engine.begin() as conn:
+            for s in selected:
+                # Final risk check and commit
+                can_trade, _ = risk_manager.can_open_trade(s['symbol'], s['position_value'])
+                if not can_trade:
+                    continue
+                risk_manager.add_position(s['symbol'], s['position_value'])
+                res = await conn.execute(
+                    signals_table.insert().values(
+                        market_id=s['market_id'], symbol=s['symbol'], direction=s['side'].lower(),
+                        entry_price=s['entry'], entry_time=pd.Timestamp(s['last_time']).isoformat(),
+                        tp1=s['tps'][0], tp2=s['tps'][1], tp3=s['tps'][2], sl=s['sl'],
+                        position_size=s['position_size_coin'], confidence=s['confidence'],
+                        market_regime=s['regime'], status='open'
+                    )
+                )
+                signal_id = res.inserted_primary_key[0] if res.inserted_primary_key else None
+                # Chart + alert if Telegram context is available (send_alert defined in Part 4)
+                chart_df = await fetch_ohlcv_cached(s['market_id'], TIMEFRAME, 400, exchange_name)
+                chart_path = await plot_annotated_chart(chart_df, s['symbol'], s['entry'], s['sl'], s['tps'])
+                if context:
+                    alert_payload = {"text": s['text'], "chart": chart_path, "signal_id": signal_id}
+                    try:
+                        await send_alert(context, alert_payload)  # defined in Part 4
+                    except Exception as e:
+                        logger.error(f"Alert send failed: {e}")
+                committed += 1
+
+        if committed > 0:
+            await _incr_daily_count(committed)
+            logger.info(f"Published {committed} signals (strict + near-miss as needed)")
+        else:
+            logger.info("No signals published after risk checks")
+    except Exception as e:
+        logger.error(f"Scan error: {e}")
+
+# ------------------------------- Position Monitor -----------------------------
+
+async def monitor_positions(context: Optional[ContextTypes.DEFAULT_TYPE] = None, exchange_name: str = 'binance'):
+    try:
+        async with engine.begin() as conn:
+            res = await conn.execute(sql_text("SELECT * FROM signals WHERE status='open'"))
+            rows = res.fetchall()
+        if not rows:
+            return
+        for r in rows:
+            try:
+                symbol = r[2]
+                direction = r[3]
+                entry_price = float(r[4])
+                tp1, tp2, tp3 = float(r[6]), float(r[7]), float(r[8])
+                sl = float(r[9])
+                size = float(r[10] or 0.0)
+                tp1_hit, tp2_hit, tp3_hit = int(r[11] or 0), int(r[12] or 0), int(r[13] or 0)
+                cur_ticker = await ccxt_call(exchange_name, 'fetch_ticker', 1, symbol)
+                price = float(cur_ticker.get('last') or cur_ticker.get('close') or 0.0)
+                if price <= 0:
+                    continue
+                position_closed = False
+                exit_reason = ""
+                if direction == 'long':
+                    if price <= sl:
+                        position_closed = True
+                        exit_reason = "Stop Loss"
+                    elif price >= tp3 and not tp3_hit:
+                        position_closed = True
+                        exit_reason = "TP3"
+                    elif price >= tp2 and not tp2_hit:
+                        async with engine.begin() as conn:
+                            await conn.execute(sql_text("UPDATE signals SET tp2_hit=1 WHERE id=:id"), {"id": r[0]})
+                    elif price >= tp1 and not tp1_hit:
+                        async with engine.begin() as conn:
+                            await conn.execute(sql_text("UPDATE signals SET tp1_hit=1 WHERE id=:id"), {"id": r[0]})
+                else:
+                    if price >= sl:
+                        position_closed = True
+                        exit_reason = "Stop Loss"
+                    elif price <= tp3 and not tp3_hit:
+                        position_closed = True
+                        exit_reason = "TP3"
+                    elif price <= tp2 and not tp2_hit:
+                        async with engine.begin() as conn:
+                            await conn.execute(sql_text("UPDATE signals SET tp2_hit=1 WHERE id=:id"), {"id": r[0]})
+                    elif price <= tp1 and not tp1_hit:
+                        async with engine.begin() as conn:
+                            await conn.execute(sql_text("UPDATE signals SET tp1_hit=1 WHERE id=:id"), {"id": r[0]})
+                if position_closed:
+                    pnl = (price - entry_price) * size if direction == 'long' else (entry_price - price) * size
+                    async with engine.begin() as conn:
+                        await conn.execute(sql_text("""
+                            UPDATE signals SET status='closed', exit_price=:p, exit_time=:t, pnl=:pl WHERE id=:id
+                        """), {"p": price, "t": datetime.now(timezone.utc).isoformat(), "pl": pnl, "id": r[0]})
+                    risk_manager.remove_position(symbol)
+                    risk_manager.update_daily_pnl(pnl)
+                    try:
+                        pnl_pct = (pnl / (entry_price * size)) * 100 if entry_price > 0 and size > 0 else 0.0
+                        performance_tracker.record_trade({
+                            'timestamp': datetime.now().isoformat(),
+                            'symbol': symbol,
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'exit_price': price,
+                            'pnl_percent': pnl_pct,
+                            'confidence': float(r[18] or 0.5),
+                            'duration_minutes': None,
+                            'market_regime': r[19],
+                            'volume_ratio': None, 'rsi': None, 'atr_ratio': None
+                        })
+                    except Exception as e:
+                        logger.warning(f"Performance recording failed: {e}")
+                    if context:
+                        note = (
+                            f"🎯 Position Closed
+
+"
+                            f"📊 {symbol} {direction.upper()}
+"
+                            f"💰 PnL: ${pnl:.2f}
+"
+                            f"🏁 Reason: {exit_reason}
+"
+                            f"📈 Entry: ${entry_price:.4f}
+"
+                            f"📉 Exit: ${price:.4f}"
+                        )
+                        try:
+                            await context.bot.send_message(chat_id=OWNER_CHAT_ID_INT, text=note, parse_mode=ParseMode.MARKDOWN)
+                        except Exception as e:
+                            logger.error(f"Close notify failed: {e}")
+            except Exception as e:
+                logger.error(f"Monitor error for id {r[0]}: {e}")
+                continue
+    except Exception as e:
+        logger.error(f"Monitor loop error: {e}")
+
+
+Part 4: Telegram handlers, health, scheduler, main
+
+# ------------------------------ Telegram Helpers ------------------------------
+
+application: Optional[Application] = None
+
+def is_authorized(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and OWNER_CHAT_ID and str(user.id) == str(OWNER_CHAT_ID))
+
+async def send_notification(context: ContextTypes.DEFAULT_TYPE, message: str):
+    try:
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID_INT, text=message, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Notification failed: {e}")
 
 async def send_alert(context: ContextTypes.DEFAULT_TYPE, alert_data: dict):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("Move SL to BE", callback_data=f"be:{alert_data['signal_id']}"),
         InlineKeyboardButton("Close Manually", callback_data=f"close:{alert_data['signal_id']}")
     ]])
-    chart_path = alert_data["chart"]
+    chart_path = alert_data.get("chart", "")
     try:
-        with open(chart_path, "rb") as chart_photo:
-            await context.bot.send_photo(
-                chat_id=OWNER_CHAT_ID_INT, photo=chart_photo, caption=alert_data["text"],
-                reply_markup=kb, parse_mode=ParseMode.MARKDOWN
+        if chart_path and os.path.exists(chart_path):
+            with open(chart_path, "rb") as chart_photo:
+                await context.bot.send_photo(
+                    chat_id=OWNER_CHAT_ID_INT,
+                    photo=chart_photo,
+                    caption=alert_data["text"],
+                    reply_markup=kb,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            try:
+                os.remove(chart_path)
+            except Exception as e:
+                logger.warning(f"Chart cleanup failed: {e}")
+        else:
+            await context.bot.send_message(
+                chat_id=OWNER_CHAT_ID_INT,
+                text=alert_data["text"],
+                reply_markup=kb,
+                parse_mode=ParseMode.MARKDOWN
             )
     except Exception as e:
-        logger.error(f"Failed to send photo alert: {e}")
-        await send_notification(context, "❌ Error sending chart image:\n\n" + alert_data["text"])
-    finally:
-        if os.path.exists(chart_path): 
-            os.remove(chart_path)
+        logger.error(f"Alert send failed: {e}")
 
-# ====================== BACKGROUND JOBS & TELEGRAM ======================
-async def enhanced_scan_markets(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Starting enhanced market scan with detailed logging...")
-    
-    try:
-        markets = await to_thread(exchange.load_markets)
-        tickers = await to_thread(exchange.fetch_tickers)
-        
-        usdt_futures = [t for t in tickers.values() 
-                       if 'USDT' in t['symbol'] 
-                       and t.get('quoteVolume') is not None
-                       and not any(skip in t['symbol'] for skip in SKIP_SYMBOLS)]
-        
-        top_markets = sorted(usdt_futures, key=lambda t: t['quoteVolume'], reverse=True)[:TOP_N_MARKETS]
-        
-        logger.info(f"Top {len(top_markets)} markets by volume: {[m['symbol'] for m in top_markets[:5]]}...")
-        
-        cooldowns = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
-        
-        for market in top_markets:
-            symbol = market['symbol']
-            market_id = market['info']['symbol']
-            
-            # Detailed logging for each market
-            logger.debug(f"Analyzing {symbol} (ID: {market_id})")
-            
-            alert_data = await generate_signal(market_id, symbol, cooldowns, exchange)
-            
-            if alert_data:
-                logger.info(f"Signal generated for {symbol}: {alert_data['text'][:100]}...")
-                await send_alert(context, alert_data)
-            else:
-                logger.debug(f"No signal for {symbol}")
-                
-    except Exception as e:
-        logger.error(f"Error during enhanced market scan: {e}")
-        await send_notification(context, f"❌ Market scan error:\n`{e}`")
+# --------------------------------- Handlers -----------------------------------
 
-async def monitor_signals(context: ContextTypes.DEFAULT_TYPE):
-    with get_db_connection() as conn:
-        open_signals = conn.execute("SELECT id, market_id, symbol, direction, entry_price, tp1, tp2, tp3, sl, tp1_hit, tp2_hit FROM signals WHERE status='open'").fetchall()
-    if not open_signals: 
-        return
-    try:
-        market_ids = list(set([s[1] for s in open_signals]))
-        symbols = [exchange.market(mid)['symbol'] for mid in market_ids]
-        tickers = await to_thread(exchange.fetch_tickers, symbols)
-    except Exception as e:
-        logger.error(f"Could not fetch tickers for monitoring: {e}")
-        return
-        
-    for sig in open_signals:
-        sig_id, m_id, sym, direction, entry, tp1, tp2, tp3, sl, tp1_hit, tp2_hit = sig
-        ticker = tickers.get(exchange.market(mid)['symbol'])
-        if not ticker or 'last' not in ticker or ticker['last'] is None: 
-            continue
-            
-        price = ticker['last']
-        now_iso = datetime.now(timezone.utc).isoformat()
-        
-        async def close_position(exit_price, pnl_percent, status_msg):
-            with get_db_connection() as conn_update:
-                conn_update.execute("UPDATE signals SET status='closed', exit_price=?, exit_time=?, pnl=? WHERE id=?", 
-                                  (exit_price, now_iso, pnl_percent, sig_id))
-            
-            # Remove position from risk manager
-            risk_manager.remove_position(sym)
-            
-            # Record trade for performance tracking
-            trade_data = {
-                'symbol': sym,
-                'direction': direction,
-                'entry_price': entry,
-                'exit_price': exit_price,
-                'pnl_percent': pnl_percent,
-                'timestamp': now_iso
-            }
-            performance_tracker.record_trade(trade_data)
-            
-            # Update risk manager
-            risk_manager.update_daily_pnl(pnl_percent)
-            
-            await send_notification(context, 
-                f"✅ *Position Closed*\nSymbol: {sym}\nReason: {status_msg}\nExit Price: {exit_price:,.4f}\nPnL: {pnl_percent:.2f}%")
-            
-        try:
-            if direction == 'long':
-                if price <= sl: 
-                    await close_position(sl, (sl - entry) / entry * 100, "Stop-Loss Hit")
-                    continue
-                if price >= tp3 and not tp2_hit: 
-                    await close_position(tp3, (tp3 - entry) / entry * 100, "TP3 Hit")
-                    continue
-                if not tp2_hit and price >= tp2:
-                    with get_db_connection() as c: 
-                        c.execute("UPDATE signals SET tp2_hit=1 WHERE id=?", (sig_id,))
-                    await send_notification(context, f"🎯 *TP2 Hit* for {sym}!")
-                if not tp1_hit and price >= tp1:
-                    with get_db_connection() as c: 
-                        c.execute("UPDATE signals SET tp1_hit=1, sl=? WHERE id=?", (entry, sig_id))
-                    await send_notification(context, f"🎯 *TP1 Hit* for {sym}! SL moved to BE ({entry:,.4f}).")
-            elif direction == 'short':
-                if price >= sl: 
-                    await close_position(sl, (entry - sl) / entry * 100, "Stop-Loss Hit")
-                    continue
-                if price <= tp3 and not tp2_hit: 
-                    await close_position(tp3, (entry - tp3) / entry * 100, "TP3 Hit")
-                    continue
-                if not tp2_hit and price <= tp2:
-                    with get_db_connection() as c: 
-                        c.execute("UPDATE signals SET tp2_hit=1 WHERE id=?", (sig_id,))
-                    await send_notification(context, f"🎯 *TP2 Hit* for {sym}!")
-                if not tp1_hit and price <= tp1:
-                    with get_db_connection() as c: 
-                        c.execute("UPDATE signals SET tp1_hit=1, sl=? WHERE id=?", (entry, sig_id))
-                    await send_notification(context, f"🎯 *TP1 Hit* for {sym}! SL moved to BE ({entry:,.4f}).")
-        except Exception as e: 
-            logger.error(f"Error monitoring signal {sig_id}: {e}")
-
-async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Generating daily report...")
-    report = get_pnl_summary(days=1)
-    
-    # Add model performance to report
-    model_perf = model_validator.calculate_model_performance()
-    if isinstance(model_perf, dict):
-        model_report = (f"\n🧠 *Model Performance:*\n"
-                       f"  - Accuracy: {model_perf['accuracy']*100:.2f}%\n"
-                       f"  - Precision: {model_perf['precision']*100:.2f}%\n"
-                       f"  - Recall: {model_perf['recall']*100:.2f}%\n"
-                       f"  - Predictions: {model_perf['total_predictions']}")
-        report += model_report
-    
-    # Add risk management status
-    risk_report = (f"\n⚠️ *Risk Status:*\n"
-                   f"  - Daily PnL: {risk_manager.daily_pnl:.2f}%\n"
-                   f"  - Daily Limit: -{MAX_DAILY_LOSS*100:.0f}%\n"
-                   f"  - Open Positions: {len(risk_manager.open_positions)}/{MAX_CONCURRENT_TRADES}")
-    report += risk_report
-    
-    await send_notification(context, f"📊 *Daily PNL Report*\n\n{report}")
-    
-    # Reset daily PnL
-    risk_manager.reset_daily_pnl()
-
-def get_pnl_summary(days=None):
-    query = "SELECT pnl FROM signals WHERE status='closed' AND pnl IS NOT NULL"
-    params = []
-    if days:
-        query += " AND exit_time >= ?"
-        params.append((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
-    with get_db_connection() as conn:
-        pnls = [row[0] for row in conn.execute(query, params).fetchall()]
-    if not pnls: 
-        return "No closed trades found for this period."
-    total_trades, wins = len(pnls), [p for p in pnls if p > 0]
-    return f"  - Total Trades: {total_trades}\n  - Win Rate: {(len(wins) / total_trades * 100):.2f}%\n  - Total PNL: {sum(pnls):.2f}%"
-
-# Add a function to clear memory-intensive objects
-def clear_large_objects():
-    """Clear large objects from memory"""
-    large_vars = [var for var in globals().items() if 
-                 isinstance(var[1], (pd.DataFrame, np.ndarray)) and 
-                 hasattr(var[1], 'nbytes') and var[1].nbytes > 1000000]  # 1MB threshold
-    
-    for name, obj in large_vars:
-        if name not in ['exchange', 'performance_tracker', 'risk_manager']:  # Keep essential objects
-            logger.info(f"Clearing large object: {name} ({obj.nbytes/1000000:.2f}MB)")
-            globals()[name] = None
-    
-    gc.collect()
-
-# Performance monitoring function
-async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        process = psutil.Process()
-        memory_usage = process.memory_info().rss / 1024 / 1024  # MB
-        
-        if memory_usage > 300:  # Reduced from 400 to 300MB
-            logger.warning(f"High memory usage: {memory_usage:.2f}MB, running garbage collection")
-            gc.collect()
-            clear_large_objects()
-            
-        if memory_usage > 400:  # Reduced from 500 to 400MB
-            logger.warning(f"Critical memory usage: {memory_usage:.2f}MB")
-            # Clear cache if memory is too high
-            with get_db_connection() as conn:
-                conn.execute("DELETE FROM ohlcv_cache WHERE fetched_at < datetime('now', '-1 hour')")
-            
-        if memory_usage > 500:  # Emergency measures
-            logger.warning(f"Emergency memory usage: {memory_usage:.2f}MB, restarting may be needed")
-            
-        cpu_percent = process.cpu_percent()
-        if cpu_percent > 80:
-            logger.warning(f"High CPU usage: {cpu_percent}%")
-            
-        # Log performance metrics
-        logger.info(f"Performance - Memory: {memory_usage:.2f}MB, CPU: {cpu_percent}%")
-    except Exception as e:
-        logger.error(f"Error monitoring performance: {e}")
-
-# Memory cleanup function (fixed to properly accept context parameter)
-async def cleanup_memory(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Running comprehensive memory cleanup...")
-    
-    # Clear DataFrame cache
-    global df_cache
-    if 'df_cache' in globals():
-        df_cache.clear()
-    
-    # Clear PyTorch cache if available
-    if PYTORCH_AVAILABLE and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        logger.info("Cleared GPU memory")
-    
-    # Force garbage collection
-    gc.collect()
-    
-    # Clear SQLite cache
-    with get_db_connection() as conn:
-        conn.execute("PRAGMA shrink_memory")
-    
-    # Clear OHLCV cache for older entries
-    with get_db_connection() as conn:
-        conn.execute("DELETE FROM ohlcv_cache WHERE fetched_at < datetime('now', '-2 hours')")
-    
-    logger.info("Comprehensive memory cleanup completed")
-
-# Database backup function (fixed to properly accept context parameter)
-async def backup_database(context: ContextTypes.DEFAULT_TYPE):
-    if os.path.exists(DB_PATH):
-        backup_path = f"{DB_PATH}.backup.{datetime.now().strftime('%Y%m%d')}"
-        shutil.copy2(DB_PATH, backup_path)
-        logger.info(f"Database backed up to {backup_path}")
-
-# Keep-alive function for Render
-async def keep_alive(context: ContextTypes.DEFAULT_TYPE):
-    """Ping the app regularly to prevent Render sleep"""
-    if not RENDER_EXTERNAL_URL:
-        return
-        
-    try:
-        health_url = f"{RENDER_EXTERNAL_URL}/health"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(health_url) as resp:
-                if resp.status == 200:
-                    logger.info("Keep-alive ping successful")
-                else:
-                    logger.warning(f"Keep-alive ping failed: {resp.status}")
-    except Exception as e:
-        logger.error(f"Keep-alive error: {e}")
-
-# Deployment notification
-async def send_deployment_notification(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        commit_hash = os.environ.get('RENDER_GIT_COMMIT', 'unknown')
-        await send_notification(
-            context, 
-            f"🚀 Bot deployed successfully!\nCommit: {commit_hash}\nTime: {datetime.now()}"
-        )
-    except Exception as e:
-        logger.error(f"Failed to send deployment notification: {e}")
-
-# ============================== TELEGRAM COMMANDS ==============================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update): 
+    if not is_authorized(update):
         return
-    await update.message.reply_text("👋 *Power Crypto Bot (Upgraded)* Activated\n\nCommands:\n`/start`, /help, /status, /pnl, /forcescan, /testalert", parse_mode=ParseMode.MARKDOWN)
+    msg = (
+        "🤖 Crypto Trading Bot Started
+
+"
+        f"📊 Monitoring {TOP_N_MARKETS} top markets
+"
+        f"⏱️ Timeframe: {TIMEFRAME}
+"
+        f"🔄 Scan Interval: {SCAN_INTERVAL//60} minutes
+"
+        f"🎯 Target Daily Signals: {TARGET_DAILY_SIGNALS}
+"
+        f"💰 Portfolio: ${PORTFOLIO_VALUE:,}
+
+"
+        "Commands:
+"
+        "/status - Bot status
+"
+        "/performance - Trading performance
+"
+        "/positions - Open positions
+"
+        "/stop - Stop bot
+"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update): 
+    if not is_authorized(update):
         return
-    with get_db_connection() as conn:
-        open_signals = conn.execute("SELECT symbol, direction, entry_price, sl, tp1, tp2, tp3 FROM signals WHERE status='open'").fetchall()
-    if not open_signals: 
-        await update.message.reply_text("No open positions.")
-    message = "📊 *Current Open Positions:\n\n" + "".join([f"{s[0]} ({s[1].upper()})*\n - Entry: {s[2]:.4f}\n - SL: {s[3]:.4f}\n\n" for s in open_signals])
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-
-async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update): 
-        return
-    await update.message.reply_text(f"📈 *Performance Summary\n\nLast 24 Hours:\n{get_pnl_summary(days=1)}\n\nAll Time:*\n{get_pnl_summary()}", parse_mode=ParseMode.MARKDOWN)
-
-async def model_performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update): 
-        return
-    perf = model_validator.calculate_model_performance()
-    if isinstance(perf, dict):
-        message = (f"🧠 *Model Performance Report*\n\n"
-                  f"Accuracy: {perf['accuracy']*100:.2f}%\n"
-                  f"Precision: {perf['precision']*100:.2f}%\n"
-                  f"Recall: {perf['recall']*100:.2f}%\n"
-                  f"Total Predictions: {perf['total_predictions']}")
-    else:
-        message = perf
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-
-async def risk_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update): 
-        return
-    message = (f"⚠️ *Risk Management Status*\n\n"
-               f"Daily PnL: {risk_manager.daily_pnl:.2f}%\n"
-               f"Daily Limit: -{MAX_DAILY_LOSS*100:.0f}%\n"
-               f"Open Positions: {len(risk_manager.open_positions)}/{MAX_CONCURRENT_TRADES}\n"
-               f"Max Position Size: {MAX_POSITION_SIZE*100:.0f}% of portfolio")
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_authorized(update): 
-        await query.edit_message_text(text="Unauthorized.")
-        return
-    action, signal_id_str = query.data.split(":")
-    signal_id = int(signal_id_str)
-    with get_db_connection() as conn:
-        sig = conn.execute("SELECT market_id, symbol, direction, entry_price, status FROM signals WHERE id=?", (signal_id,)).fetchone()
-    if not sig or sig[4] != 'open': 
-        await query.edit_message_caption(caption=query.message.caption_markdown + "\n\n*Action failed: Trade closed.*", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    market_id, symbol, direction, entry_price, _ = sig
-    if action == "be":
-        with get_db_connection() as c: 
-            c.execute("UPDATE signals SET sl=? WHERE id=?", (entry_price, signal_id))
-        msg = f"⚡ *Manual:* SL for {symbol} moved to BE ({entry_price:,.4f})."
-        await send_notification(context, msg)
-        await query.edit_message_caption(caption=query.message.caption_markdown + f"\n\n*{msg}*", parse_mode=ParseMode.MARKDOWN)
-    elif action == "close":
-        try:
-            ticker = await to_thread(exchange.fetch_ticker, exchange.market(market_id)['symbol'])
-            price = ticker['last']
-            pnl = ((price-entry_price)/entry_price*100) if direction=='long' else ((entry_price-price)/entry_price*100)
-            with get_db_connection() as c: 
-                c.execute("UPDATE signals SET status='closed', exit_price=?, exit_time=?, pnl=? WHERE id=?",(price,datetime.now(timezone.utc).isoformat(),pnl,signal_id))
-            # Remove from risk manager
-            risk_manager.remove_position(symbol)
-            msg = f"⚡ *Manual Close:* {symbol} closed at {price:,.4f}. PNL: {pnl:.2f}%."
-            await send_notification(context, msg)
-            await query.edit_message_caption(caption=query.message.caption_markdown + f"\n\n*{msg}*", parse_mode=ParseMode.MARKDOWN)
-        except Exception as e: 
-            await send_notification(context, f"❌ Error closing {symbol}: {e}")
-
-async def testalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update): 
-        return
-    
-    message = await update.message.reply_text("🧪 Sending test alert...")
-    
     try:
-        await send_notification(context, "🧪 Test alert: Bot is connected and working properly.")
-        await message.edit_text("✅ Test notification sent successfully.")
-    except Exception as e:
-        logger.error(f"Test alert failed: {e}")
-        await message.edit_text(f"❌ Test alert failed: {str(e)}")
+        async with engine.begin() as conn:
+            res1 = await conn.execute(sql_text("SELECT COUNT(*) FROM signals WHERE status='open'"))
+            open_signals = res1.scalar() or 0
+            res2 = await conn.execute(sql_text("SELECT COUNT(*) FROM signals"))
+            total_signals = res2.scalar() or 0
+        model_status = "✅ Loaded" if hybrid_model is not None else "❌ Fallback Mode"
+        status_message = (
+            f"🤖 Bot Status
 
-async def forcescan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update): 
+"
+            f"🟢 Status: Active
+"
+            f"🧠 Model: {model_status}
+"
+            f"📊 Open Positions: {open_signals}
+"
+            f"📈 Total Signals: {total_signals}
+"
+            f"💰 Daily PnL: ${risk_manager.daily_pnl:.2f}
+"
+            f"⚠️ Risk Level: {len(risk_manager.open_positions)}/{MAX_CONCURRENT_TRADES}
+"
+        )
+        await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Status error: {e}")
+        await update.message.reply_text("❌ Error retrieving status")
+
+async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
         return
-    
-    message = await update.message.reply_text("🔍 Forcing a one-time market scan...")
-    
     try:
-        await enhanced_scan_markets(context)
-        await message.edit_text("✅ One-time scan completed. Check for new signals.")
-    except Exception as e:
-        logger.error(f"Forced scan failed: {e}")
-        await message.edit_text(f"❌ Scan failed: {str(e)}")
+        async with engine.begin() as conn:
+            # Simple aggregate across all closed trades (DB-agnostic)
+            res = await conn.execute(sql_text("""
+                SELECT 
+                    COUNT(*) as total_trades,
+                    AVG(pnl) as avg_pnl,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+                    MAX(pnl) as best_trade,
+                    MIN(pnl) as worst_trade
+                FROM signals
+                WHERE status = 'closed'
+            """))
+            row = res.fetchone()
+        if row and row[0] > 0:
+            total, avg_pnl, wins, best, worst = row
+            win_rate = (wins / total) * 100 if total > 0 else 0
+            msg = (
+                f"📊 Performance Summary
 
-# ============================== BOT INITIALIZATION ==============================
-def main():
-    global application
-    
-    # Get port from environment variable (required for Render)
-    port = int(os.environ.get("PORT", 10000))
-    
-    # Initialize the Telegram bot application
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Add handlers
-    application.add_handler(CommandHandler(["start", "help"], start_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("pnl", pnl_command))
-    application.add_handler(CommandHandler("model", model_performance_command))
-    application.add_handler(CommandHandler("risk", risk_status_command))
-    application.add_handler(CommandHandler("testalert", testalert_cmd))
-    application.add_handler(CommandHandler("forcescan", forcescan_cmd))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Set up job queue
-    job_queue = application.job_queue
-    job_queue.run_repeating(enhanced_scan_markets, interval=SCAN_INTERVAL, first=10)
-    job_queue.run_repeating(monitor_signals, interval=MONITOR_INTERVAL, first=5)
-    job_queue.run_repeating(monitor_performance, interval=300, first=60)  # Every 5 minutes
-    job_queue.run_repeating(cleanup_memory, interval=1800, first=120)  # Every 30 minutes
-    job_queue.run_repeating(keep_alive, interval=600, first=60)  # Every 10 minutes for keep-alive
-    job_queue.run_daily(backup_database, time=dtime(hour=2, minute=0, tzinfo=timezone.utc))  # Daily backup at 2 AM UTC
-    
-    # Daily report and risk reset
-    report_time_aware = dtime(hour=REPORT_TIME.hour, minute=REPORT_TIME.minute, tzinfo=REPORT_TIMEZONE)
-    job_queue.run_daily(daily_report, time=report_time_aware)
-    
-    # Daily risk reset (at midnight UTC)
-    job_queue.run_daily(lambda ctx: risk_manager.reset_daily_pnl(), time=dtime(hour=0, minute=0, tzinfo=timezone.utc))
-    
-    # Startup notification
-    async def post_init(app: Application):
-        await app.bot.send_message(chat_id=OWNER_CHAT_ID_INT, text="🚀 *Bot Upgraded & Live!*\nNew features:\n- Advanced Risk Management\n- Multi-Timeframe Analysis\n- Performance Tracking\n- Model Validation")
-        await send_deployment_notification(app)
-        logger.info("Startup notification sent to owner.")
-        
-        # Set webhook if in webhook mode
-        if WEBHOOK_MODE and RENDER_EXTERNAL_URL:
-            webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-            await app.bot.set_webhook(
-                url=webhook_url,
-                secret_token=WEBHOOK_SECRET,
-                allowed_updates=Update.ALL_TYPES
+"
+                f"🎯 Total Trades: {total}
+"
+                f"✅ Win Rate: {win_rate:.1f}%
+"
+                f"💰 Avg PnL: ${avg_pnl:.2f}
+"
+                f"🚀 Best Trade: ${best:.2f}
+"
+                f"📉 Worst Trade: ${worst:.2f}
+"
             )
-            logger.info(f"Webhook set to {webhook_url}")
-    
-    application.post_init = post_init
+            perf = model_validator.calculate_model_performance()
+            if isinstance(perf, dict):
+                msg += (
+                    f"
+🧠 Model Metrics
+"
+                    f"🎯 Accuracy: {perf['accuracy']:.1%}
+"
+                    f"📈 Precision: {perf['precision']:.1%}
+"
+                    f"🔄 Recall: {perf['recall']:.1%}
+"
+                )
+        else:
+            msg = "📊 No closed trades yet"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Performance error: {e}")
+        await update.message.reply_text("❌ Error retrieving performance data")
 
-    # Start Flask app in a separate thread
-    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    logger.info(f"Flask health check server started on port {port}")
-    
-    # Start the bot
-    if WEBHOOK_MODE:
-        logger.info("Running in webhook mode")
-        # We're already setting the webhook in post_init
+async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+    try:
+        async with engine.begin() as conn:
+            res = await conn.execute(sql_text("SELECT symbol, entry_price, sl, tp1, tp2, tp3, status FROM signals WHERE status='open'"))
+            rows = res.fetchall()
+        if not rows:
+            await update.message.reply_text("No open positions")
+            return
+        lines = ["📌 Open Positions:"]
+        for r in rows:
+            sym, entry, sl, tp1, tp2, tp3, st = r
+            lines.append(f"- {sym} | Entry {entry:.4f} | SL {sl:.4f} | TP1 {tp1:.4f} | TP2 {tp2:.4f} | TP3 {tp3:.4f}")
+        await update.message.reply_text("
+".join(lines))
+    except Exception as e:
+        logger.error(f"Positions error: {e}")
+        await update.message.reply_text("❌ Error retrieving positions")
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not is_authorized(update):
+        await query.answer("Unauthorized")
+        return
+    await query.answer()
+    try:
+        action, signal_id = query.data.split(":")
+        signal_id = int(signal_id)
+        async with engine.begin() as conn:
+            if action == "be":
+                res = await conn.execute(sql_text(
+                    "UPDATE signals SET sl = entry_price WHERE id = :id AND status='open'"), {"id": signal_id})
+                if res.rowcount and res.rowcount > 0:
+                    await query.edit_message_caption(
+                        caption=(query.message.caption or "") + "
+
+✅ Stop Loss moved to Breakeven",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await query.edit_message_caption(
+                        caption=(query.message.caption or "") + "
+
+❌ Signal not found or already closed",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+            elif action == "close":
+                res = await conn.execute(sql_text(
+                    "UPDATE signals SET status='closed', exit_time = :t WHERE id = :id AND status='open'"),
+                    {"id": signal_id, "t": datetime.now(timezone.utc).isoformat()}
+                )
+                if res.rowcount and res.rowcount > 0:
+                    row2 = await conn.execute(sql_text("SELECT symbol FROM signals WHERE id=:id"), {"id": signal_id})
+                    symrow = row2.fetchone()
+                    if symrow:
+                        risk_manager.remove_position(symrow[0])
+                    await query.edit_message_caption(
+                        caption=(query.message.caption or "") + "
+
+✅ Position closed manually",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await query.edit_message_caption(
+                        caption=(query.message.caption or "") + "
+
+❌ Signal not found or already closed",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+        await query.edit_message_caption(
+            caption=(query.message.caption or "") + "
+
+❌ Error processing request",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+# ------------------------------ Health Endpoints ------------------------------
+
+flask_app = Flask(_name_)
+
+@flask_app.route('/health')
+def health_check():
+    try:
+        ok_ex = True
+        try:
+            _ = exchange.fetch_time()
+            ok_ex = True
+        except Exception:
+            ok_ex = False
+        status = 'healthy' if ok_ex else 'degraded'
+        return jsonify({'status': status, 'timestamp': datetime.now().isoformat()})
+    except Exception as e:
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+
+@flask_app.route('/')
+def home():
+    return jsonify({'message': 'Crypto Trading Bot is running', 'status': 'active'})
+
+@flask_app.route('/webhook', methods=['POST'])
+def telegram_webhook():
+    if not SecurityManager.validate_webhook_secret(request, WEBHOOK_SECRET):
+        return 'Forbidden', 403
+    try:
+        update = Update.de_json(request.get_json(), application.bot)
+        application.process_update(update)
+        return 'OK'
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'Error', 500
+
+# ------------------------------- Telegram App ---------------------------------
+
+def build_telegram_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("performance", performance_command))
+    app.add_handler(CommandHandler("positions", positions_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    return app
+
+# --------------------------------- Scheduler ----------------------------------
+
+async def scheduled_runner(app: Application):
+    try:
+        # Run scans on SCAN_INTERVAL cadence; monitor more frequently
+        scan_timer = 0
+        while True:
+            if scan_timer <= 0:
+                await scan_markets(app)
+                scan_timer = SCAN_INTERVAL
+            await monitor_positions(app)
+            await asyncio.sleep(MONITOR_INTERVAL)
+            scan_timer -= MONITOR_INTERVAL
+            # Reset daily PnL and Redis counter at local midnight
+            now = datetime.now(REPORT_TIMEZONE)
+            if now.hour == 0 and now.minute == 0:
+                risk_manager.reset_daily_pnl()
+    except asyncio.CancelledError:
+        logger.info("Scheduler cancelled")
+
+# ----------------------------------- Main -------------------------------------
+
+def start_flask(port: int):
+    flask_app.run(host='0.0.0.0', port=port)
+
+async def main():
+    global application
+    if not BOT_TOKEN or not OWNER_CHAT_ID_INT:
+        logger.critical("Missing CRYPTO_BOT_TOKEN or CRYPTO_OWNER_ID")
+        return
+    await init_db()
+    application = build_telegram_app()
+
+    # Health server on separate port to avoid webhook conflict
+    FLASK_PORT = int(os.environ.get("FLASK_PORT", "8081"))
+
+    if WEBHOOK_MODE and RENDER_EXTERNAL_URL:
+        # Start Flask health in background
+        asyncio.get_running_loop().run_in_executor(None, start_flask, FLASK_PORT)
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         application.run_webhook(
             listen="0.0.0.0",
-            port=port,
-            secret_token=WEBHOOK_SECRET,
-            webhook_url=f"{RENDER_EXTERNAL_URL}/webhook"
+            port=8080,
+            url_path="/webhook",
+            webhook_url=webhook_url,
+            secret_token=WEBHOOK_SECRET
         )
     else:
-        logger.info("Running in polling mode")
-        application.run_polling()
+        # Polling mode: start Flask in background, then run app + scheduler
+        asyncio.get_running_loop().run_in_executor(None, start_flask, FLASK_PORT)
+        await application.initialize()
+        await application.start()
+        scheduler_task = asyncio.create_task(scheduled_runner(application))
+        try:
+            # Start polling updates
+            await application.updater.start_polling()
+            await scheduler_task
+        except KeyboardInterrupt:
+            logger.info("Stopping...")
+        finally:
+            scheduler_task.cancel()
+            await application.stop()
 
-if __name__ == "__main__":
-    main()
+if _name_ == "_main_":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
