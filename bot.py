@@ -108,7 +108,7 @@ class Config:
         self.render_external_url = os.environ.get("RENDER_EXTERNAL_URL", "")
         self.webhook_secret = os.environ.get("WEBHOOK_SECRET", ''.join(random.choices(string.ascii_letters + string.digits, k=16)))
         
-        self.db_url = os.environ.get("DATABASE_URL", "").strip()
+        self.db_url = os.environ.get ('postgres://', 'postgresql+asyncpg://') 
         self.db_path = os.environ.get("DB_PATH", "/tmp/power_crypto_bot.db")
         if not self.db_url:
             self.db_url = f"sqlite+aiosqlite:///{self.db_path}"
@@ -2096,5 +2096,6 @@ async def main():
     
 if __name__ == "__main__" and not config.webhook_mode:
     flask_app.run(host='0.0.0.0', port=config.flask_port)
+
 
 
