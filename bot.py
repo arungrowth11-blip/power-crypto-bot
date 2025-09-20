@@ -2093,12 +2093,8 @@ async def main():
         finally:
             scheduler_task.cancel()
             await application.stop()
+    
+if __name__ == "__main__" and not config.webhook_mode:
+    flask_app.run(host='0.0.0.0', port=config.flask_port)
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("bot_stopped")
-    except Exception as e:
-        logger.error("fatal_error", error=str(e))
 
