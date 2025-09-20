@@ -14,9 +14,11 @@ import hashlib
 import requests
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Any, List, Tuple
+import psutil  # Added for memory monitoring
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from datetime import datetime, timedelta, time as dtime, timezone, date
 from collections import defaultdict
+from functools import wraps
 
 # Timezones
 try:
@@ -138,6 +140,11 @@ DAY_END_CATCHUP_HOURS = int(os.environ.get("DAY_END_CATCHUP_HOURS", 3))  # last 
 
 DAILY_SIGNAL_KEY_PREFIX = "signals:day:"
 
+# Retry configuration
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 3))
+RETRY_DELAY = float(os.environ.get("RETRY_DELAY", 1.0))
+RETRY_BACKOFF = float(os.environ.get("RETRY_BACKOFF", 2.0))
+
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
@@ -159,21 +166,60 @@ class SecurityManager:
         return hmac.compare_digest(token, expected)
 
 # ------------------------------------------------------------------------------
-# Memory Manager (PyTorch)
+# Enhanced Memory Manager (PyTorch)
 # ------------------------------------------------------------------------------
 
-class MemoryManager:
-    def _init_(self, max_memory_percent: int = 85):
+class EnhancedMemoryManager:
+    def __init__(self, max_memory_percent: int = 85):
         self.max_memory_percent = max_memory_percent
+        self.usage_history = []
+        
     def cleanup(self):
         gc.collect()
         if PYTORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            # Log GPU memory usage if available
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                cached = torch.cuda.memory_reserved() / 1024**3
+                logger.info(f"GPU memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+                
     def guard(self):
-        self.cleanup()
+        memory_percent = psutil.virtual_memory().percent
+        self.usage_history.append(memory_percent)
+        # Keep only last 100 readings
+        self.usage_history = self.usage_history[-100:]
+        
+        if memory_percent > self.max_memory_percent:
+            logger.warning(f"Memory usage high: {memory_percent}%")
+            self.cleanup()
 
-memory_manager = MemoryManager()
+memory_manager = EnhancedMemoryManager()
+
+# ------------------------------------------------------------------------------
+# Retry Decorator
+# ------------------------------------------------------------------------------
+
+def with_retry(max_retries=MAX_RETRIES, delay=RETRY_DELAY, backoff=RETRY_BACKOFF):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    retries += 1
+                    if retries >= max_retries:
+                        logger.error(f"Failed after {max_retries} retries: {e}")
+                        raise
+                    wait_time = delay * (backoff ** (retries - 1))
+                    logger.warning(f"Retry {retries}/{max_retries} after error: {e}. Waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+            return None
+        return wrapper
+    return decorator
 
 # ------------------------------------------------------------------------------
 # Exchange Rate Limiter
@@ -185,7 +231,7 @@ class ExchangeRateLimiter:
         'bybit': {'window_sec': 60, 'weight_limit': 600},
         'okx': {'window_sec': 60, 'weight_limit': 300},
     }
-    def _init_(self):
+    def __init__(self):
         self.usage = defaultdict(int)
         self.window_start = defaultdict(lambda: time.time())
         self._lock = asyncio.Lock()
@@ -214,7 +260,7 @@ rate_limiter = ExchangeRateLimiter()
 # ------------------------------------------------------------------------------
 
 class ExchangeFactory:
-    def _init_(self):
+    def __init__(self):
         self.exchanges: Dict[str, Any] = {}
     def get_exchange(self, name: str = 'binance'):
         if name in self.exchanges:
@@ -319,7 +365,7 @@ if REDIS_URL and aioredis is not None:
 # ------------------------------------------------------------------------------
 
 class PerformanceTracker:
-    def _init_(self):
+    def __init__(self):
         self.today = date.today().isoformat()
         self.filename = f"performance_{self.today}.csv"
         if not os.path.exists(self.filename):
@@ -354,21 +400,42 @@ class PerformanceTracker:
 performance_tracker = PerformanceTracker()
 
 # ------------------------------------------------------------------------------
-# Risk Manager
+# Enhanced Risk Manager
 # ------------------------------------------------------------------------------
 
-class RiskManager:
-    def _init_(self, portfolio_value: float):
+class EnhancedRiskManager:
+    def __init__(self, portfolio_value: float):
         self.portfolio_value = portfolio_value
         self.daily_pnl = 0.0
         self.max_daily_loss = portfolio_value * MAX_DAILY_LOSS
         self.open_positions: Dict[str, float] = {}
         self.max_concurrent_trades = MAX_CONCURRENT_TRADES
+        self.position_correlations = {}  # Track correlations between positions
+        
     def add_position(self, symbol: str, size_usd: float):
         self.open_positions[symbol] = size_usd
+        
     def remove_position(self, symbol: str):
         self.open_positions.pop(symbol, None)
-    def can_open_trade(self, symbol: str, proposed_size_usd: float) -> Tuple[bool, str]:
+        
+    async def check_correlation(self, new_symbol: str, existing_positions: List[str]) -> bool:
+        """Check if new symbol is highly correlated with existing positions"""
+        if len(existing_positions) == 0:
+            return True
+            
+        # Simplified correlation check - in practice, you'd want to implement
+        # a proper correlation calculation based on historical price data
+        base_currency = new_symbol.split('/')[0]
+        for position in existing_positions:
+            pos_currency = position.split('/')[0]
+            # Simple check: avoid multiple positions in similar cryptocurrencies
+            if base_currency == pos_currency:
+                logger.warning(f"Rejecting {new_symbol}: already in {position}")
+                return False
+                
+        return True
+        
+    async def can_open_trade(self, symbol: str, proposed_size_usd: float) -> Tuple[bool, str]:
         if self.daily_pnl <= -self.max_daily_loss:
             return False, "Daily loss limit exceeded"
         if len(self.open_positions) >= self.max_concurrent_trades:
@@ -377,20 +444,28 @@ class RiskManager:
             return False, "Already in this symbol"
         if proposed_size_usd > self.portfolio_value * MAX_POSITION_SIZE:
             return False, "Position size too large"
+            
+        # Add correlation check
+        existing_positions = list(self.open_positions.keys())
+        if not await self.check_correlation(symbol, existing_positions):
+            return False, "Highly correlated with existing positions"
+            
         return True, "OK"
+        
     def update_daily_pnl(self, pnl: float):
         self.daily_pnl += pnl
+        
     def reset_daily_pnl(self):
         self.daily_pnl = 0.0
 
-risk_manager = RiskManager(PORTFOLIO_VALUE)
+risk_manager = EnhancedRiskManager(PORTFOLIO_VALUE)
 
 # ------------------------------------------------------------------------------
 # Model Validator
 # ------------------------------------------------------------------------------
 
 class ModelValidator:
-    def _init_(self):
+    def __init__(self):
         self.predictions: List[float] = []
         self.actuals: List[int] = []
     def record_prediction(self, confidence: float, actual_pnl: float):
@@ -422,7 +497,7 @@ model_validator = ModelValidator()
 # ------------------------------------------------------------------------------
 
 class MultiTimeframeAnalyzer:
-    def _init_(self):
+    def __init__(self):
         self.timeframes = ['15m', '30m', '1h', '4h']
         self.weights = {'15m': 0.15, '30m': 0.25, '1h': 0.35, '4h': 0.25}
     async def analyze_multi_timeframe(self, symbol: str, exchange_name: str):
@@ -615,8 +690,8 @@ def _compute_dynamic_policy(published: int, target: int, tz: ZoneInfo) -> Dict[s
 # ---------------------- Hybrid Model & Confidence Scoring ----------------------
 
 class HybridModel(nn.Module):
-    def _init_(self, input_size=10, hidden_size=64, nhead=4):
-        super()._init_()
+    def __init__(self, input_size=10, hidden_size=64, nhead=4):
+        super().__init__()
         self.recurrent_layer = nn.GRU(input_size=input_size, hidden_size=hidden_size,
                                       batch_first=True, num_layers=2, dropout=0.2)
         transformer_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=nhead,
@@ -729,6 +804,7 @@ async def cache_get(key: str) -> Optional[bytes]:
 
 # ------------------------------- CCXT Wrappers --------------------------------
 
+@with_retry()
 async def ccxt_call(exchange_name: str, method: str, weight: int, *args, **kwargs):
     await rate_limiter.acquire(exchange_name, weight)
     ex = exchange_factory.get_exchange(exchange_name)
@@ -737,6 +813,7 @@ async def ccxt_call(exchange_name: str, method: str, weight: int, *args, **kwarg
 
 # -------------------------- OHLCV & Order Book Fetchers -----------------------
 
+@with_retry()
 async def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int = 100,
                              exchange_name: str = 'binance') -> Optional[pd.DataFrame]:
     cache_key = f"ohlcv:{exchange_name}:{symbol}:{timeframe}:{limit}"
@@ -788,6 +865,7 @@ async def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int = 100,
         logger.error(f"fetch_ohlcv error for {symbol} {timeframe}: {e}")
         return None
 
+@with_retry()
 async def fetch_orderbook_features(symbol: str, exchange_name: str = 'binance') -> Dict[str, float]:
     try:
         ob = await ccxt_call(exchange_name, 'fetch_order_book', 1, symbol, 10)
@@ -834,6 +912,34 @@ def get_optimal_parameters(market_regime: str) -> Dict[str, float]:
     }
     return regimes.get(market_regime, regimes['choppy'])
 
+# ----------------------------- Signal Validation ------------------------------
+
+async def validate_signal(signal: Dict[str, Any]) -> bool:
+    """Perform additional validation on generated signals"""
+    if not signal:
+        return False
+        
+    # Check if recent price action confirms the signal
+    try:
+        df = await fetch_ohlcv_cached(signal['market_id'], '5m', limit=10, 
+                                     exchange_name='binance')
+        if df is None or len(df) < 5:
+            return True  # Can't validate, but don't reject
+            
+        recent_trend = (df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5]
+        
+        if signal['side'] == 'Long' and recent_trend < -0.01:  # Down 1% in last 5 candles
+            logger.warning(f"Rejecting long signal due to recent downtrend: {recent_trend:.2%}")
+            return False
+            
+        if signal['side'] == 'Short' and recent_trend > 0.01:  # Up 1% in last 5 candles
+            logger.warning(f"Rejecting short signal due to recent uptrend: {recent_trend:.2%}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Signal validation error: {e}")
+        
+    return True
 
 # ----------------------------- Signal Generation ------------------------------
 
@@ -929,7 +1035,7 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: Dict[s
         position_size_coin = dynamic_position_sizing(PORTFOLIO_VALUE, sl_dist, confidence)
         position_value = position_size_coin * entry_price
 
-        can_trade, _ = risk_manager.can_open_trade(display_symbol, position_value)
+        can_trade, _ = await risk_manager.can_open_trade(display_symbol, position_value)
         if not can_trade:
             return None
 
@@ -941,7 +1047,8 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: Dict[s
             tps = [entry_price - atr * m for m in TP_MULT]
 
         alert = format_alert(display_symbol, side, entry_price, sl, tps, confidence, position_size_coin, regime)
-        return {
+        
+        signal_data = {
             "symbol": display_symbol,
             "market_id": market_id,
             "side": side,
@@ -962,6 +1069,12 @@ async def generate_signal(market_id: str, display_symbol: str, cooldowns: Dict[s
             "strict": strict_ok,
             "near_miss": (not strict_ok) and near_ok
         }
+        
+        # Additional validation
+        if not await validate_signal(signal_data):
+            return None
+            
+        return signal_data
     except Exception as e:
         logger.exception(f"Signal generation error for {market_id}: {e}")
         return None
@@ -1011,38 +1124,20 @@ async def plot_annotated_chart(df: pd.DataFrame, display_symbol: str, entry: flo
 
 def format_alert(symbol: str, side: str, entry: float, sl: float, tps: list, confidence: float, position_size: float, regime: str) -> str:
     return (
-        f"📈 {symbol} Signal ({TIMEFRAME})
-
-"
-        f"{'🚀' if side == 'Long' else '📉'} Trade Type: {side.upper()}
-"
-        f"🧠  Confidence: {confidence*100:.1f}%
-"
-        f"📊 Market Regime: {regime.title()}
-
-"
-        f"Trade Parameters:
-"
-        f"  - Entry: {entry:,.4f}
-"
-        f"  - Stop-loss: {sl:,.4f}
-
-"
-        f"Take-Profit Targets:
-"
-        f"  - TP1: {tps[0]:,.4f}
-"
-        f"  - TP2: {tps[1]:,.4f}
-"
-        f"  - TP3: {tps[2]:,.4f}
-
-"
-        f"Sizing & Risk (Based on ${PORTFOLIO_VALUE:,} portfolio):
-"
-        f"  - Suggested Size: {position_size:.4f} {symbol.split('/')[0]}
-"
-        f"  - Position Value: ${(position_size * entry):,.2f}
-"
+        f"📈 {symbol} Signal ({TIMEFRAME})\n\n"
+        f"{'🚀' if side == 'Long' else '📉'} Trade Type: {side.upper()}\n"
+        f"🧠  Confidence: {confidence*100:.1f}%\n"
+        f"📊 Market Regime: {regime.title()}\n\n"
+        f"Trade Parameters:\n"
+        f"  - Entry: {entry:,.4f}\n"
+        f"  - Stop-loss: {sl:,.4f}\n\n"
+        f"Take-Profit Targets:\n"
+        f"  - TP1: {tps[0]:,.4f}\n"
+        f"  - TP2: {tps[1]:,.4f}\n"
+        f"  - TP3: {tps[2]:,.4f}\n\n"
+        f"Sizing & Risk (Based on ${PORTFOLIO_VALUE:,} portfolio):\n"
+        f"  - Suggested Size: {position_size:.4f} {symbol.split('/')[0]}\n"
+        f"  - Position Value: ${(position_size * entry):,.2f}\n"
         f"⚡ Move SL to entry after TP1 is hit."
     )
 
@@ -1155,7 +1250,7 @@ async def scan_markets(context: Optional[ContextTypes.DEFAULT_TYPE] = None, exch
         async with engine.begin() as conn:
             for s in selected:
                 # Final risk check and commit
-                can_trade, _ = risk_manager.can_open_trade(s['symbol'], s['position_value'])
+                can_trade, _ = await risk_manager.can_open_trade(s['symbol'], s['position_value'])
                 if not can_trade:
                     continue
                 risk_manager.add_position(s['symbol'], s['position_value'])
@@ -1169,13 +1264,13 @@ async def scan_markets(context: Optional[ContextTypes.DEFAULT_TYPE] = None, exch
                     )
                 )
                 signal_id = res.inserted_primary_key[0] if res.inserted_primary_key else None
-                # Chart + alert if Telegram context is available (send_alert defined in Part 4)
+                # Chart + alert if Telegram context is available
                 chart_df = await fetch_ohlcv_cached(s['market_id'], TIMEFRAME, 400, exchange_name)
                 chart_path = await plot_annotated_chart(chart_df, s['symbol'], s['entry'], s['sl'], s['tps'])
                 if context:
                     alert_payload = {"text": s['text'], "chart": chart_path, "signal_id": signal_id}
                     try:
-                        await send_alert(context, alert_payload)  # defined in Part 4
+                        await send_alert(context, alert_payload)
                     except Exception as e:
                         logger.error(f"Alert send failed: {e}")
                 committed += 1
@@ -1264,17 +1359,11 @@ async def monitor_positions(context: Optional[ContextTypes.DEFAULT_TYPE] = None,
                         logger.warning(f"Performance recording failed: {e}")
                     if context:
                         note = (
-                            f"🎯 Position Closed
-
-"
-                            f"📊 {symbol} {direction.upper()}
-"
-                            f"💰 PnL: ${pnl:.2f}
-"
-                            f"🏁 Reason: {exit_reason}
-"
-                            f"📈 Entry: ${entry_price:.4f}
-"
+                            f"🎯 Position Closed\n\n"
+                            f"📊 {symbol} {direction.upper()}\n"
+                            f"💰 PnL: ${pnl:.2f}\n"
+                            f"🏁 Reason: {exit_reason}\n"
+                            f"📈 Entry: ${entry_price:.4f}\n"
                             f"📉 Exit: ${price:.4f}"
                         )
                         try:
@@ -1286,7 +1375,6 @@ async def monitor_positions(context: Optional[ContextTypes.DEFAULT_TYPE] = None,
                 continue
     except Exception as e:
         logger.error(f"Monitor loop error: {e}")
-
 
 # ------------------------------ Telegram Helpers ------------------------------
 
@@ -1338,30 +1426,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "🤖 Crypto Trading Bot Started
-
-"
-        f"📊 Monitoring {TOP_N_MARKETS} top markets
-"
-        f"⏱️ Timeframe: {TIMEFRAME}
-"
-        f"🔄 Scan Interval: {SCAN_INTERVAL//60} minutes
-"
-        f"🎯 Target Daily Signals: {TARGET_DAILY_SIGNALS}
-"
-        f"💰 Portfolio: ${PORTFOLIO_VALUE:,}
-
-"
-        "Commands:
-"
-        "/status - Bot status
-"
-        "/performance - Trading performance
-"
-        "/positions - Open positions
-"
-        "/stop - Stop bot
-"
+        "🤖 Crypto Trading Bot Started\n\n"
+        f"📊 Monitoring {TOP_N_MARKETS} top markets\n"
+        f"⏱️ Timeframe: {TIMEFRAME}\n"
+        f"🔄 Scan Interval: {SCAN_INTERVAL//60} minutes\n"
+        f"🎯 Target Daily Signals: {TARGET_DAILY_SIGNALS}\n"
+        f"💰 Portfolio: ${PORTFOLIO_VALUE:,}\n\n"
+        "Commands:\n"
+        "/status - Bot status\n"
+        "/performance - Trading performance\n"
+        "/stats - Trading statistics\n"
+        "/positions - Open positions\n"
+        "/stop - Stop bot\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -1376,21 +1452,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_signals = res2.scalar() or 0
         model_status = "✅ Loaded" if hybrid_model is not None else "❌ Fallback Mode"
         status_message = (
-            f"🤖 Bot Status
-
-"
-            f"🟢 Status: Active
-"
-            f"🧠 Model: {model_status}
-"
-            f"📊 Open Positions: {open_signals}
-"
-            f"📈 Total Signals: {total_signals}
-"
-            f"💰 Daily PnL: ${risk_manager.daily_pnl:.2f}
-"
-            f"⚠️ Risk Level: {len(risk_manager.open_positions)}/{MAX_CONCURRENT_TRADES}
-"
+            f"🤖 Bot Status\n\n"
+            f"🟢 Status: Active\n"
+            f"🧠 Model: {model_status}\n"
+            f"📊 Open Positions: {open_signals}\n"
+            f"📈 Total Signals: {total_signals}\n"
+            f"💰 Daily PnL: ${risk_manager.daily_pnl:.2f}\n"
+            f"⚠️ Risk Level: {len(risk_manager.open_positions)}/{MAX_CONCURRENT_TRADES}\n"
         )
         await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -1418,32 +1486,20 @@ async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             total, avg_pnl, wins, best, worst = row
             win_rate = (wins / total) * 100 if total > 0 else 0
             msg = (
-                f"📊 Performance Summary
-
-"
-                f"🎯 Total Trades: {total}
-"
-                f"✅ Win Rate: {win_rate:.1f}%
-"
-                f"💰 Avg PnL: ${avg_pnl:.2f}
-"
-                f"🚀 Best Trade: ${best:.2f}
-"
-                f"📉 Worst Trade: ${worst:.2f}
-"
+                f"📊 Performance Summary\n\n"
+                f"🎯 Total Trades: {total}\n"
+                f"✅ Win Rate: {win_rate:.1f}%\n"
+                f"💰 Avg PnL: ${avg_pnl:.2f}\n"
+                f"🚀 Best Trade: ${best:.2f}\n"
+                f"📉 Worst Trade: ${worst:.2f}\n"
             )
             perf = model_validator.calculate_model_performance()
             if isinstance(perf, dict):
                 msg += (
-                    f"
-🧠 Model Metrics
-"
-                    f"🎯 Accuracy: {perf['accuracy']:.1%}
-"
-                    f"📈 Precision: {perf['precision']:.1%}
-"
-                    f"🔄 Recall: {perf['recall']:.1%}
-"
+                    f"\n🧠 Model Metrics\n"
+                    f"🎯 Accuracy: {perf['accuracy']:.1%}\n"
+                    f"📈 Precision: {perf['precision']:.1%}\n"
+                    f"🔄 Recall: {perf['recall']:.1%}\n"
                 )
         else:
             msg = "📊 No closed trades yet"
@@ -1451,6 +1507,50 @@ async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Performance error: {e}")
         await update.message.reply_text("❌ Error retrieving performance data")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+        
+    try:
+        # Calculate some interesting statistics
+        async with engine.begin() as conn:
+            # Winning percentage
+            res = await conn.execute(sql_text("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winners
+                FROM signals 
+                WHERE status = 'closed'
+            """))
+            row = res.fetchone()
+            win_rate = (row[1] / row[0] * 100) if row[0] > 0 else 0
+            
+            # Average holding time
+            res2 = await conn.execute(sql_text("""
+                SELECT 
+                    AVG((julianday(exit_time) - julianday(entry_time)) * 24 * 60) as avg_minutes
+                FROM signals 
+                WHERE status = 'closed' AND exit_time IS NOT NULL
+            """))
+            avg_hold = res2.scalar() or 0
+            
+        msg = (
+            f"📊 Trading Statistics\n\n"
+            f"🏆 Win Rate: {win_rate:.1f}%\n"
+            f"⏱️ Avg Holding Time: {avg_hold:.1f} minutes\n"
+            f"💰 Daily PnL: ${risk_manager.daily_pnl:.2f}\n"
+            f"📈 Open Positions: {len(risk_manager.open_positions)}\n"
+        )
+        
+        # Add memory usage info
+        memory_percent = psutil.virtual_memory().percent
+        msg += f"🧠 Memory Usage: {memory_percent:.1f}%\n"
+        
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        await update.message.reply_text("❌ Error retrieving statistics")
 
 async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -1466,8 +1566,7 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in rows:
             sym, entry, sl, tp1, tp2, tp3, st = r
             lines.append(f"- {sym} | Entry {entry:.4f} | SL {sl:.4f} | TP1 {tp1:.4f} | TP2 {tp2:.4f} | TP3 {tp3:.4f}")
-        await update.message.reply_text("
-".join(lines))
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.error(f"Positions error: {e}")
         await update.message.reply_text("❌ Error retrieving positions")
@@ -1489,16 +1588,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "UPDATE signals SET sl = entry_price WHERE id = :id AND status='open'"), {"id": signal_id})
                 if res.rowcount and res.rowcount > 0:
                     await query.edit_message_caption(
-                        caption=(query.message.caption or "") + "
-
-✅ Stop Loss moved to Breakeven",
+                        caption=(query.message.caption or "") + "\n\n✅ Stop Loss moved to Breakeven",
                         parse_mode=ParseMode.MARKDOWN
                     )
                 else:
                     await query.edit_message_caption(
-                        caption=(query.message.caption or "") + "
-
-❌ Signal not found or already closed",
+                        caption=(query.message.caption or "") + "\n\n❌ Signal not found or already closed",
                         parse_mode=ParseMode.MARKDOWN
                     )
             elif action == "close":
@@ -1512,30 +1607,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if symrow:
                         risk_manager.remove_position(symrow[0])
                     await query.edit_message_caption(
-                        caption=(query.message.caption or "") + "
-
-✅ Position closed manually",
+                        caption=(query.message.caption or "") + "\n\n✅ Position closed manually",
                         parse_mode=ParseMode.MARKDOWN
                     )
                 else:
                     await query.edit_message_caption(
-                        caption=(query.message.caption or "") + "
-
-❌ Signal not found or already closed",
+                        caption=(query.message.caption or "") + "\n\n❌ Signal not found or already closed",
                         parse_mode=ParseMode.MARKDOWN
                     )
     except Exception as e:
         logger.error(f"Callback error: {e}")
         await query.edit_message_caption(
-            caption=(query.message.caption or "") + "
-
-❌ Error processing request",
+            caption=(query.message.caption or "") + "\n\n❌ Error processing request",
             parse_mode=ParseMode.MARKDOWN
         )
 
 # ------------------------------ Health Endpoints ------------------------------
 
-flask_app = Flask(_name_)
+flask_app = Flask(__name__)
 
 @flask_app.route('/health')
 def health_check():
@@ -1574,6 +1663,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("performance", performance_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("positions", positions_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     return app
@@ -1641,11 +1731,12 @@ async def main():
             scheduler_task.cancel()
             await application.stop()
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+
 
