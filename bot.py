@@ -180,7 +180,7 @@ ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
 TP_MULT = [float(x) for x in os.environ.get("TP_MULT", "0.75,1.5,3.0").split(",")]
 SL_MULT = float(os.environ.get("SL_MULT", 1.5))
-CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.40))
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.50))
 
 # --- Risk Management ---
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", 0.02))
@@ -202,7 +202,7 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PARAMETER_GRID = {
     'RSI_BUY': [50, 52, 55],
     'RSI_SELL': [48, 45, 42],
-    'CONFIDENCE_THRESHOLD': [0.3, 0.40, 0.7],
+    'CONFIDENCE_THRESHOLD': [0.6, 0.60, 0.7],
     'TP_MULT_1': [0.5, 0.75, 1.0],
     'TP_MULT_2': [1.5, 2.0, 2.5],
     'TP_MULT_3': [3.0, 4.0, 5.0],
@@ -1202,8 +1202,8 @@ async def monitor_performance(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error monitoring performance: {e}")
 
-# Memory cleanup function (fixed to accept context parameter)
-async def cleanup_memory(context: ContextTypes.DEFAULT_TYPE = None):
+# Memory cleanup function (fixed to properly accept context parameter)
+async def cleanup_memory(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Running comprehensive memory cleanup...")
     
     # Clear DataFrame cache
@@ -1229,15 +1229,15 @@ async def cleanup_memory(context: ContextTypes.DEFAULT_TYPE = None):
     
     logger.info("Comprehensive memory cleanup completed")
 
-# Database backup function
-async def backup_database(context: ContextTypes.DEFAULT_TYPE = None):
+# Database backup function (fixed to properly accept context parameter)
+async def backup_database(context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(DB_PATH):
         backup_path = f"{DB_PATH}.backup.{datetime.now().strftime('%Y%m%d')}"
         shutil.copy2(DB_PATH, backup_path)
         logger.info(f"Database backed up to {backup_path}")
 
 # Keep-alive function for Render
-async def keep_alive(context: ContextTypes.DEFAULT_TYPE = None):
+async def keep_alive(context: ContextTypes.DEFAULT_TYPE):
     """Ping the app regularly to prevent Render sleep"""
     if not RENDER_EXTERNAL_URL:
         return
@@ -1277,7 +1277,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         open_signals = conn.execute("SELECT symbol, direction, entry_price, sl, tp1, tp2, tp3 FROM signals WHERE status='open'").fetchall()
     if not open_signals: 
         await update.message.reply_text("No open positions.")
-        return
     message = "📊 *Current Open Positions:\n\n" + "".join([f"{s[0]} ({s[1].upper()})*\n - Entry: {s[2]:.4f}\n - SL: {s[3]:.4f}\n\n" for s in open_signals])
     await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
@@ -1449,5 +1448,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
